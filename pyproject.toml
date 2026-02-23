@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashoptim"
+version = "0.1.2"
+description = "Memory-Efficient PyTorch optimizers"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Databricks AI Research"}
+]
+requires-python = ">=3.9"
+keywords = ["pytorch", "optimizer", "memory-efficient", "deep-learning", "training"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7.0",
+    "triton>=2.0.0; sys_platform == 'linux'",
+    "packaging>=21.0.0",
+    "numpy>=1.21.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/databricks/flashoptim"
+Repository = "https://github.com/databricks/flashoptim"
+Issues = "https://github.com/databricks/flashoptim/issues"
+Paper = "https://arxiv.org/abs/2602.23349"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-codeblocks>=0.13.0",
+    "ruff>=0.1.0",
+    "pre-commit>=3.0.0",
+    "packaging>=21.0",
+]
+all = [
+    "flashoptim[dev]",
+]
+
+[project.entry-points."llmfoundry_optimizers"]
+flash_adam = "flashoptim:FlashAdam"
+flash_adam_w = "flashoptim:FlashAdamW"
+flash_lion = "flashoptim:FlashLion"
+flash_sgd = "flashoptim:FlashSGD"
+flash_sgd_w = "flashoptim:FlashSGDW"
+
+[tool.setuptools.packages.find]
+include = ["flashoptim*"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # line too long, handled by formatter
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+    "W191",  # indentation contains tabs
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["flashoptim"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+addopts = "-v --tb=short"
+markers = [
+    "gpu: marks tests as requiring GPU (deselect with '-m \"not gpu\"')",
+]

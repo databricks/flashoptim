@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite our paper."
+title: "FlashOptim"
+license: Apache-2.0
+repository-code: "https://github.com/databricks/flashoptim"
+preferred-citation:
+  type: article
+  title: "FlashOptim: Optimizers for Memory Efficient Training"
+  authors:
+    - family-names: "Gonzalez Ortiz"
+      given-names: "Jose Javier"
+    - family-names: "Gupta"
+      given-names: "Abhay"
+    - family-names: "Rinard"
+      given-names: "Chris"
+    - family-names: "Blalock"
+      given-names: "Davis"
+  year: 2026
+  url: "https://arxiv.org/abs/2602.23349"
