@@ -1,4 +1,4 @@
-# FlashOptim
+<img src="https://raw.githubusercontent.com/databricks/flashoptim/refs/heads/assets/imgs/flashoptim_ithaca_italic.png" alt="FlashOptim" width="650">
 
 This is the official implementation of [FlashOptim: Optimizers for Memory Efficient Training](https://arxiv.org/abs/2602.23349)
 
