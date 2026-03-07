@@ -15,7 +15,7 @@ from .optimizers import (
     reconstruct_fp32_param,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "FlashAdam",

@@ -8,6 +8,8 @@ This test verifies that error correction code (ECC) maintains key invariants:
 3. 16-bit ECC is always at least as good as 8-bit ECC
 """
 
+from typing import Union
+
 import pytest
 import torch
 import triton
@@ -214,7 +216,7 @@ def check_ecc_invariants(
 
 def _assert_invariants_within_tolerance(
     narrow_dtype: str,
-    exponent_range: range | list[int],
+    exponent_range: Union[range, list[int]],
     tolerance: dict[tuple[str, str], int],
 ) -> None:
     """Run ECC invariant checks for all signs/exponents and assert within tolerance.

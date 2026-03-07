@@ -71,11 +71,11 @@ def _check_roundtrip_quality(
     cos_sim = torch.cosine_similarity(
         x_flat.float(), x_recon_flat.float(), dim=0
     ).item()
-    assert cos_sim > 0.99, f"Cosine similarity {cos_sim} too low"
+    assert cos_sim > 0.9999, f"Cosine similarity {cos_sim} too low"
 
     mae_val = (x_recon_flat - x_flat).abs().mean().item()
     absmax = x_flat.abs().max().item()
-    # Expected max MAE: half a quantization bin width with 1.6x tolerance
+    # Expected max MAE: half a quantization bin width with tolerance multiplier
     max_mae = (2 * absmax) / 255.0 / 2 * 1.6
     assert mae_val <= max_mae, f"MAE {mae_val} too high (max {max_mae})"
 
@@ -94,6 +94,26 @@ def _case_seed_id(case_seed: tuple[str, int]) -> str:
     return f"{case_seed[0]}_seed{case_seed[1]}"
 
 
+# (signed, sqrt, softsign) — only the combos that matter in practice:
+# signed+softsign (exp_avg), unsigned+sqrt (exp_avg_sq), and plain baselines.
+_QUANT_MODE_COMBOS = [
+    (True, False, False),  # plain signed
+    (True, False, True),  # signed + softsign (used by exp_avg)
+    (False, False, False),  # plain unsigned
+    (False, True, False),  # unsigned + sqrt (used by exp_avg_sq)
+]
+
+
+def _quant_mode_id(combo: tuple[bool, bool, bool]) -> str:
+    signed, sqrt, softsign = combo
+    parts = ["signed" if signed else "unsigned"]
+    if sqrt:
+        parts.append("sqrt")
+    if softsign:
+        parts.append("softsign")
+    return "_".join(parts)
+
+
 @pytest.mark.parametrize(
     "test_case,seed",
     _ROUNDTRIP_CASES,
@@ -105,7 +125,11 @@ def _case_seed_id(case_seed: tuple[str, int]) -> str:
     ids=[shape_id(s) for s in _COMPRESSION_PARAM_SHAPES],
 )
 @pytest.mark.parametrize("dtype", _FLOAT_DTYPES, ids=dtype_id)
-@pytest.mark.parametrize("signed", [True, False], ids=["signed", "unsigned"])
+@pytest.mark.parametrize(
+    "signed,sqrt,softsign",
+    _QUANT_MODE_COMBOS,
+    ids=[_quant_mode_id(c) for c in _QUANT_MODE_COMBOS],
+)
 def test_quantize_dequantize_roundtrip(
     test_case: str,
     seed: int,
@@ -113,13 +137,17 @@ def test_quantize_dequantize_roundtrip(
     D: int,
     dtype: torch.dtype,
     signed: bool,
+    sqrt: bool,
+    softsign: bool,
 ):
     """Test that dequantize(quantize(x)) ≈ x for various inputs and configurations."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     x = _make_test_tensor(test_case, (N, D), dtype, signed, gen)
 
-    quantized, scales = quantize(x, signed=signed)
-    x_reconstructed = dequantize(quantized, scales, signed=signed)
+    quantized, scales = quantize(x, signed=signed, sqrt=sqrt, softsign=softsign)
+    x_reconstructed = dequantize(
+        quantized, scales, signed=signed, sqrt=sqrt, softsign=softsign
+    )
 
     _check_roundtrip_quality(x, x_reconstructed, test_case)
 
@@ -135,9 +163,9 @@ def test_maybe_quantized_tensor_quantized_state(signed: bool):
     mqt.set_data(x)
 
     assert mqt.is_quantized()
-    assert mqt.quantized is not None
-    assert mqt.scales is not None
-    assert mqt.data is None
+    assert mqt._quantized is not None
+    assert mqt._scales is not None
+    assert mqt._data is None
 
     expected_int_dtype = torch.int8 if signed else torch.uint8
     assert mqt.quantized.dtype == expected_int_dtype
@@ -149,15 +177,18 @@ def test_maybe_quantized_tensor_passthrough(dtype: torch.dtype):
     """Test that _MaybeQuantizedTensor with try_quantize=False preserves data exactly."""
     x = torch.randn(32, 64, device="cuda", dtype=dtype)
 
-    mqt = _MaybeQuantizedTensor(None, try_quantize=False, signed=True)
+    mqt = _MaybeQuantizedTensor(
+        None, try_quantize=False, signed=True, storage_dtype=dtype
+    )
     mqt.set_data(x)
 
     assert not mqt.is_quantized()
-    assert mqt.data is not None
-    assert mqt.quantized is None
+    assert mqt._data is not None
+    assert mqt._quantized is None
 
     x_out = mqt.materialize()
-    torch.testing.assert_close(x_out, x.float())
+    assert x_out.dtype == dtype
+    torch.testing.assert_close(x_out, x)
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +239,6 @@ def test_quantize_nonaligned_tail_group_error(N: int, signed: bool):
     tail_data = x[-tail_size:]
     expected_absmax = tail_data.abs().max().item()
     actual_scale = scales[-1].item()
-    assert abs(actual_scale - expected_absmax) / max(expected_absmax, 1e-12) < 0.01, (
+    assert abs(actual_scale - expected_absmax) / max(expected_absmax, 1e-12) < 0.003, (
         f"Tail scale {actual_scale} does not match expected absmax {expected_absmax}"
     )

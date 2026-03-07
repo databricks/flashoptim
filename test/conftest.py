@@ -17,6 +17,23 @@ def _allow_ineffective_master_weight_bits():
     os.environ.pop("FLASHOPTIM_ALLOW_INEFFECTIVE_MASTER_WEIGHT_BITS", None)
 
 
+def pytest_collection_modifyitems(config, items):
+    """Auto-deselect thirdparty tests unless explicitly requested via -m."""
+    marker_expr = config.getoption("-m", default="")
+    if "thirdparty" in marker_expr:
+        return
+    remaining = []
+    deselected = []
+    for item in items:
+        if "thirdparty" in item.keywords:
+            deselected.append(item)
+        else:
+            remaining.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = remaining
+
+
 def pytest_sessionstart(session):
     """Check for CUDA availability before running any tests."""
     if not torch.cuda.is_available():

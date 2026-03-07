@@ -3,6 +3,7 @@
 
 import copy
 import tempfile
+from typing import Optional
 
 import numpy as np
 import pytest
@@ -29,7 +30,7 @@ _OPT_CONFIGS = [LION_CONFIG, SGDM_CONFIG, ADAMW_CONFIG]
 AMP_MIN_CORRELATION = 0.9999
 AMP_MAX_NMSE_GRADSCALER = 5e-4  # worst observed ~1.3e-4
 AMP_MAX_NMSE_BF16_NATIVE = 1e-4  # worst observed ~3.6e-5
-AMP_MAX_NMSE_AUTOCAST = 1e-6  # worst observed ~0 (exact for fp32 optimizer)
+AMP_MAX_NMSE_AUTOCAST = 3e-7
 
 
 @pytest.fixture(params=_OPT_CONFIGS, ids=[config.name for config in _OPT_CONFIGS])
@@ -43,7 +44,7 @@ def seed_id(seed: int) -> str:
     return f"seed{seed}"
 
 
-def amp_mode_id(mode: str | None) -> str:
+def amp_mode_id(mode: Optional[str]) -> str:
     """Generate readable ID for AMP modes."""
     return mode if mode else "no_amp"
 
@@ -124,7 +125,7 @@ _CKPT_CONFIGS = [
 ]
 
 
-def ckpt_id(config: tuple[bool, int | None]) -> str:
+def ckpt_id(config: tuple[bool, Optional[int]]) -> str:
     quantize, mwb = config
     q = "quant" if quantize else "noquant"
     ecc = "noECC" if mwb is None else f"ecc{mwb}b"
@@ -179,7 +180,7 @@ def _run_single_process_training(
     dataset: Dataset,
     num_steps: int,
     batch_size: int = 8,
-    amp_mode: str | None = None,
+    amp_mode: Optional[str] = None,
     device: str = "cuda",
 ) -> list[float]:
     model = model.to(device)
@@ -400,9 +401,9 @@ def test_joint_model_optimizer_checkpoint(
 
     losses_fresh = _train_steps(model_fresh, opt_fresh, batches, N, total)
 
-    loss_tol = 5e-3 if quantize else 1e-3
-    min_cossim = 0.99 if quantize else 0.9999
-    max_nmse = 1e-3 if quantize else 1e-5
+    loss_tol = 2e-4 if quantize else 1e-4
+    min_cossim = 0.99 if quantize else 0.99999
+    max_nmse = 2e-4 if quantize else 1e-6
 
     for i, (lo, lf) in enumerate(zip(losses_orig, losses_fresh)):
         rel = abs(lo - lf) / (abs(lo) + 1e-12)

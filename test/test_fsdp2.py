@@ -6,10 +6,12 @@ Step-by-step FSDP2 numerical accuracy testing.
 Compares FSDP2 training against a non-distributed baseline at each step,
 using unshard()/full_tensor() to materialize full parameters for comparison.
 
-Each pytest test case = one (optimizer x setting x reshard_after_forward) group.
-The inner function loops over all dtype/ecc/quant configs within a single
+Each pytest test case = one optimizer. The inner function loops over all
+settings, reshard options, and dtype/ecc/quant configs within a single
 mp.spawn call, amortizing process creation + NCCL init/destroy overhead.
 """
+
+from typing import Optional
 
 import pytest
 import torch
@@ -66,7 +68,7 @@ class DeterministicShardedDataset:
 
     def get_global_batch(
         self, step: int
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Get concatenated batch for non-distributed baseline (B * world_size samples)."""
         start = step * self.batch_size * self.world_size
         end = start + self.batch_size * self.world_size
@@ -76,7 +78,7 @@ class DeterministicShardedDataset:
 
     def get_rank_batch(
         self, step: int, rank: int
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Get batch for specific rank (B samples)."""
         global_start = step * self.batch_size * self.world_size
         rank_start = global_start + rank * self.batch_size
@@ -203,7 +205,7 @@ def reshard_after_comparison(model: nn.Module):
 
 
 def compare_weights_fsdp2(
-    model_baseline: nn.Module | None,  # None on ranks > 0
+    model_baseline: Optional[nn.Module],  # None on ranks > 0
     model_fsdp2: nn.Module,
     rank: int,
     step: int,
@@ -253,32 +255,12 @@ def compare_weights_fsdp2(
 
 
 def get_test_params():
-    params = []
-
-    for opt_config in _OPT_CONFIGS:
-        for setting in SETTINGS:
-            # Gradient release doesn't support grad accumulation — release hooks fire
-            # per-parameter before gradients are synchronized across microbatches.
-            if setting.get("grad_release", False) and setting["grad_accum"] > 1:
-                continue
-
-            for reshard_after_forward in RESHARD_AFTER_FORWARD_OPTIONS:
-                params.append(
-                    {
-                        "opt_config": opt_config,
-                        "setting": setting,
-                        "reshard_after_forward": reshard_after_forward,
-                    }
-                )
-
-    return params
+    """One entry per optimizer; settings/reshard batched inside mp.spawn."""
+    return [{"opt_config": opt} for opt in _OPT_CONFIGS]
 
 
 def _get_test_id(cfg: dict) -> str:
-    setting_name = cfg["setting"]["name"]
-    opt_name = cfg["opt_config"].name
-    reshard = "reshard" if cfg["reshard_after_forward"] else "no_reshard"
-    return f"{setting_name}_{opt_name}_{reshard}"
+    return cfg["opt_config"].name
 
 
 # ============================================================================
@@ -439,8 +421,8 @@ def _run_single_fsdp2_config(
         yb_rank = yb_rank_raw.to(device=device, dtype=model_dtype)
 
         # Get global batch for baseline (rank 0 only)
-        xb_global: torch.Tensor | None = None
-        yb_global: torch.Tensor | None = None
+        xb_global: Optional[torch.Tensor] = None
+        yb_global: Optional[torch.Tensor] = None
         if rank == 0:
             xb_global_raw, yb_global_raw = dataset.get_global_batch(step)
             assert xb_global_raw is not None and yb_global_raw is not None
@@ -608,33 +590,38 @@ def _run_fsdp2_accuracy_test(
     rank: int, world_size: int, test_config: dict, seed: int
 ) -> None:
     opt_config: OptimizerTestConfig = test_config["opt_config"]
-    setting: dict = test_config["setting"]
-    reshard_after_forward: bool = test_config["reshard_after_forward"]
 
-    reshard_str = "reshard" if reshard_after_forward else "no_reshard"
-    for dtype, ecc_bytes, quantized in DIST_DTYPE_ECC_QUANT_CONFIGS:
-        config_id = dtype_ecc_quant_id((dtype, ecc_bytes, quantized))
-        if rank == 0:
-            print(
-                f"  Running {opt_config.name} {config_id} "
-                f"with {setting['name']}, {reshard_str}..."
-            )
-        _run_single_fsdp2_config(
-            rank,
-            world_size,
-            opt_config,
-            setting,
-            reshard_after_forward,
-            dtype,
-            ecc_bytes,
-            quantized,
-            seed,
-        )
-        if rank == 0:
-            print(
-                f"  [OK] {opt_config.name} {config_id} "
-                f"with {setting['name']}, {reshard_str}"
-            )
+    for setting in SETTINGS:
+        # Gradient release doesn't support grad accumulation — release hooks fire
+        # per-parameter before gradients are synchronized across microbatches.
+        if setting.get("grad_release", False) and setting["grad_accum"] > 1:
+            continue
+
+        for reshard_after_forward in RESHARD_AFTER_FORWARD_OPTIONS:
+            reshard_str = "reshard" if reshard_after_forward else "no_reshard"
+            for dtype, ecc_bytes, quantized in DIST_DTYPE_ECC_QUANT_CONFIGS:
+                config_id = dtype_ecc_quant_id((dtype, ecc_bytes, quantized))
+                if rank == 0:
+                    print(
+                        f"  Running {opt_config.name} {config_id} "
+                        f"with {setting['name']}, {reshard_str}..."
+                    )
+                _run_single_fsdp2_config(
+                    rank,
+                    world_size,
+                    opt_config,
+                    setting,
+                    reshard_after_forward,
+                    dtype,
+                    ecc_bytes,
+                    quantized,
+                    seed,
+                )
+                if rank == 0:
+                    print(
+                        f"  [OK] {opt_config.name} {config_id} "
+                        f"with {setting['name']}, {reshard_str}"
+                    )
 
 
 @pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
@@ -716,3 +703,143 @@ def test_fsdp2_fp32_state_dict_roundtrip(
     fsdp2_runner,
 ) -> None:
     fsdp2_runner(_run_fsdp2_fp32_state_dict_roundtrip, opt_config, seed)
+
+
+# ============================================================================
+# FSDP2 DCP (distributed checkpoint) state dict roundtrip test
+# ============================================================================
+
+_DCP_CONFIGS = [
+    (False, None),  # uncompressed, no ECC
+    (False, 24),  # uncompressed, ECC 24-bit
+    (True, None),  # compressed, no ECC
+    (True, 24),  # compressed, ECC 24-bit
+    (True, 32),  # compressed, ECC 32-bit
+]
+
+
+def _dcp_config_id(cfg: tuple[bool, int | None]) -> str:
+    compress, ecc = cfg
+    prefix = "compressed" if compress else "uncompressed"
+    suffix = f"ecc{ecc}" if ecc else "no_ecc"
+    return f"{prefix}_{suffix}"
+
+
+def _run_fsdp2_dcp_state_dict_roundtrip(
+    rank: int,
+    world_size: int,
+    opt_config: OptimizerTestConfig,
+    compress: bool,
+    master_weight_bits: int | None,
+    ckpt_dir: str,
+    seed: int,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    d_in, d_out = 32, 16
+    dtype = torch.bfloat16
+    lr = 0.001
+
+    opt_kwargs: dict = {
+        "lr": lr,
+        "compress_state_dict": compress,
+        "master_weight_bits": master_weight_bits,
+    }
+
+    # --- Create model + optimizer, train 3 steps ---
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model = _create_simple_model(d_in, d_out).to(device=device, dtype=dtype)
+    dist.barrier()
+    fully_shard(model)
+
+    opt = opt_config.factory(model.parameters(), **opt_kwargs)
+    loss_fn = nn.MSELoss()
+
+    g = torch.Generator(device=device).manual_seed(seed + rank)
+    for _ in range(3):
+        x = torch.randn(8, d_in, device=device, dtype=dtype, generator=g)
+        y = torch.randn(8, d_out, device=device, dtype=dtype, generator=g)
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    # --- Save optimizer state via DCP ---
+    saved_osd = get_optimizer_state_dict(model, opt)
+    dcp.save({"optimizer": saved_osd}, checkpoint_id=ckpt_dir)
+    dist.barrier()
+
+    # --- Load into a fresh template and verify roundtrip ---
+    loaded_osd = get_optimizer_state_dict(model, opt)
+    dcp.load({"optimizer": loaded_osd}, checkpoint_id=ckpt_dir)
+
+    # Verify every state tensor survived the DCP roundtrip exactly
+    for fqn in saved_osd["state"]:
+        saved_state = saved_osd["state"][fqn]
+        loaded_state = loaded_osd["state"][fqn]
+        for key in saved_state:
+            v_saved = saved_state[key]
+            v_loaded = loaded_state[key]
+            if isinstance(v_saved, torch.Tensor) and v_saved.dim() > 0:
+                vs = v_saved.to_local() if hasattr(v_saved, "to_local") else v_saved
+                vl = v_loaded.to_local() if hasattr(v_loaded, "to_local") else v_loaded
+                assert torch.equal(vs, vl), (
+                    f"[Rank {rank}] state[{fqn}].{key} changed after "
+                    f"DCP roundtrip: max diff = "
+                    f"{(vs.float() - vl.float()).abs().max().item()}"
+                )
+
+    # Apply loaded state and verify optimizer can still step
+    set_optimizer_state_dict(model, opt, loaded_osd)
+
+    x = torch.randn(8, d_in, device=device, dtype=dtype)
+    y = torch.randn(8, d_out, device=device, dtype=dtype)
+    loss = loss_fn(model(x), y)
+    loss.backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+    # Verify parameters are still finite after step
+    unshard_for_comparison(model)
+    try:
+        for name, p in model.named_parameters():
+            p_full = get_full_tensor(p)
+            assert torch.isfinite(p_full).all(), (
+                f"[Rank {rank}] Parameter '{name}' has non-finite values "
+                f"after DCP load + step"
+            )
+    finally:
+        reshard_after_comparison(model)
+
+    del model, opt
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
+@pytest.mark.parametrize("dcp_config", _DCP_CONFIGS, ids=_dcp_config_id)
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=lambda c: c.name)
+def test_fsdp2_dcp_state_dict_roundtrip(
+    opt_config: OptimizerTestConfig,
+    dcp_config: tuple[bool, int | None],
+    seed: int,
+    fsdp2_runner,
+    tmp_path,
+) -> None:
+    compress, master_weight_bits = dcp_config
+    fsdp2_runner(
+        _run_fsdp2_dcp_state_dict_roundtrip,
+        opt_config,
+        compress,
+        master_weight_bits,
+        str(tmp_path / "ckpt"),
+        seed,
+    )

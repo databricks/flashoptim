@@ -178,12 +178,12 @@ def compare_weights(
 
 
 def get_test_params():
-    """OPT_CONFIGS x SETTINGS; dtype/ecc/quant batched inside mp.spawn."""
-    return [{"opt_config": opt, "setting": s} for opt in _OPT_CONFIGS for s in SETTINGS]
+    """One entry per optimizer; settings batched inside mp.spawn."""
+    return [{"opt_config": opt} for opt in _OPT_CONFIGS]
 
 
 def _get_test_id(cfg: dict) -> str:
-    return f"{cfg['setting']['name']}_{cfg['opt_config'].name}"
+    return cfg["opt_config"].name
 
 
 def _run_single_ddp_config(
@@ -433,24 +433,26 @@ def _run_ddp_accuracy_test(
     rank: int, world_size: int, test_config: dict, seed: int
 ) -> None:
     opt_config: OptimizerTestConfig = test_config["opt_config"]
-    setting: dict = test_config["setting"]
 
-    for dtype, ecc_bytes, quantized in DIST_DTYPE_ECC_QUANT_CONFIGS:
-        config_id = dtype_ecc_quant_id((dtype, ecc_bytes, quantized))
-        if rank == 0:
-            print(f"  Running {opt_config.name} {config_id} with {setting['name']}...")
-        _run_single_ddp_config(
-            rank,
-            world_size,
-            opt_config,
-            setting,
-            dtype,
-            ecc_bytes,
-            quantized,
-            seed,
-        )
-        if rank == 0:
-            print(f"  [OK] {opt_config.name} {config_id} with {setting['name']}")
+    for setting in SETTINGS:
+        for dtype, ecc_bytes, quantized in DIST_DTYPE_ECC_QUANT_CONFIGS:
+            config_id = dtype_ecc_quant_id((dtype, ecc_bytes, quantized))
+            if rank == 0:
+                print(
+                    f"  Running {opt_config.name} {config_id} with {setting['name']}..."
+                )
+            _run_single_ddp_config(
+                rank,
+                world_size,
+                opt_config,
+                setting,
+                dtype,
+                ecc_bytes,
+                quantized,
+                seed,
+            )
+            if rank == 0:
+                print(f"  [OK] {opt_config.name} {config_id} with {setting['name']}")
 
 
 @pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")

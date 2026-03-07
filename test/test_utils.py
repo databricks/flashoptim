@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 from collections.abc import Callable
+from typing import Optional
 
 import torch
 from reference import ReferenceAdamW, ReferenceLion, ReferenceSGDW
@@ -111,6 +112,13 @@ SGDM_CONFIG = OptimizerTestConfig(
     state_var_names=["momentum_buffer"],
 )
 
+SGD_ZERO_MOM_CONFIG = OptimizerTestConfig(
+    name="FlashSGD_ZeroMom",
+    factory=functools.partial(FlashSGD, momentum=0.0),
+    reference_factory=functools.partial(TorchSGD, momentum=0.0),
+    state_var_names=[],
+)
+
 SGDM_NESTEROV_CONFIG = OptimizerTestConfig(
     name="FlashSGDM_Nesterov",
     factory=functools.partial(FlashSGD, momentum=0.9, nesterov=True),
@@ -200,7 +208,7 @@ def lr_id(lr: float) -> str:
         return f"lr{lr:.0e}"
 
 
-def master_weight_bits_id(mb: int | None) -> str:
+def master_weight_bits_id(mb: Optional[int]) -> str:
     """Generate readable ID for master_weight_bits values."""
     if mb is None:
         return "noECC"
@@ -217,7 +225,7 @@ def quantized_state_id(quantized: bool) -> str:
     return "quantized" if quantized else "unquantized"
 
 
-def dtype_ecc_quant_id(combo: tuple[torch.dtype, int | None, bool]) -> str:
+def dtype_ecc_quant_id(combo: tuple[torch.dtype, Optional[int], bool]) -> str:
     """Generate readable ID for (dtype, ecc_bits, quantized) tuples."""
     dtype, ecc_bits, quantized = combo
     quant_str = "quant" if quantized else "unquant"
@@ -225,7 +233,9 @@ def dtype_ecc_quant_id(combo: tuple[torch.dtype, int | None, bool]) -> str:
     return f"{dtype_id(dtype)}_{ecc_str}_{quant_str}"
 
 
-def dtype_ecc_quant_fused_id(combo: tuple[torch.dtype, int | None, bool, bool]) -> str:
+def dtype_ecc_quant_fused_id(
+    combo: tuple[torch.dtype, Optional[int], bool, bool],
+) -> str:
     """Generate readable ID for (dtype, ecc_bits, quantized, fused) tuples."""
     dtype, ecc_bits, quantized, fused = combo
     quant_str = "quant" if quantized else "unquant"

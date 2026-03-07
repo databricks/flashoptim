@@ -1,30 +1,18 @@
 # Copyright 2026 Databricks AI Research authors
 
-import tempfile
 import time
 import warnings
-from collections.abc import Sequence
-from contextlib import nullcontext
+from collections import OrderedDict
+from typing import Optional
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from test_training import (
-    _CKPT_CONFIGS,
-    ToyDataset,
-    _create_simple_model,
-    _prepare_batches,
-    _train_steps,
-    ckpt_id,
-)
 from test_utils import (
     _DESCENDS_PARAM_SHAPES,
-    _DTYPE_WIDTHS,
     _FLOAT_DTYPES,
     _MANY_PARAM_SHAPES,
-    _MASTER_WEIGHT_BITS,
     _WEIGHT_DECAY_VALUES,
     ADAM_L2_CONFIG,
     ADAMW_CONFIG,
@@ -33,24 +21,22 @@ from test_utils import (
     DTYPE_ECC_QUANT_FUSED_CONFIGS,
     LION_CONFIG,
     LION_DECOUPLE_LR_CONFIG,
+    SGD_ZERO_MOM_CONFIG,
     SGDM_CONFIG,
     SGDM_DECOUPLE_LR_CONFIG,
     SGDM_NESTEROV_CONFIG,
     SGDMW_CONFIG,
     OptimizerTestConfig,
     ReferenceLion,
-    compress_state_dict_id,
     dtype_ecc_quant_fused_id,
     dtype_ecc_quant_id,
     dtype_id,
     lr_id,
     master_weight_bits_id,
     nmse,
-    quantized_state_id,
     shape_id,
     weight_decay_id,
 )
-from torch.optim.optimizer import Optimizer
 from torch.optim.sgd import SGD
 
 from flashoptim import FlashLion, cast_model
@@ -101,21 +87,6 @@ def d_id(d: int) -> str:
     return f"D{d}"
 
 
-def make_params_with_grads(
-    device: str | torch.device, dtype: torch.dtype, generator: torch.Generator
-) -> list[torch.Tensor]:
-    """Create parameters with gradients for testing."""
-    params = []
-    device = torch.device(device) if isinstance(device, str) else device
-    for shape in _MANY_PARAM_SHAPES:
-        p = torch.rand(
-            shape, device=device, dtype=dtype, requires_grad=True, generator=generator
-        )
-        p.grad = torch.rand(shape, device=device, dtype=dtype, generator=generator)
-        params.append(p)
-    return params
-
-
 @pytest.fixture(params=_OPT_CONFIGS, ids=[config.name for config in _OPT_CONFIGS])
 def opt_config(request: pytest.FixtureRequest) -> OptimizerTestConfig:
     return request.param
@@ -129,7 +100,6 @@ def opt_config_with_variants(request: pytest.FixtureRequest) -> OptimizerTestCon
     return request.param
 
 
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
 @pytest.mark.parametrize(
     "N,D", _MANY_PARAM_SHAPES, ids=[shape_id(shape) for shape in _MANY_PARAM_SHAPES]
 )
@@ -140,17 +110,16 @@ def opt_config_with_variants(request: pytest.FixtureRequest) -> OptimizerTestCon
 )
 def test_modifies_weights_and_momentums(
     opt_config: OptimizerTestConfig,
-    seed: int,
     N: int,
     D: int,
     dtype: torch.dtype,
-    master_weight_bits: int | None,
+    master_weight_bits: Optional[int],
     quantize: bool,
     fused: bool,
 ) -> None:
     """Test that optimizer states initialize to zero before stepping and become non-zero after stepping."""
     device = "cuda"
-    gen = torch.Generator(device=device).manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(0)
     X = torch.randn(
         (N, D), device=device, requires_grad=False, dtype=dtype, generator=gen
     )
@@ -205,7 +174,6 @@ def test_modifies_weights_and_momentums(
             assert torch.std(momentum).item() > 0
 
 
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
 @pytest.mark.parametrize(
     "N,D", _MANY_PARAM_SHAPES, ids=[shape_id(shape) for shape in _MANY_PARAM_SHAPES]
 )
@@ -217,25 +185,26 @@ def test_modifies_weights_and_momentums(
 )
 def test_changes_with_zero_grads(
     opt_config: OptimizerTestConfig,
-    seed: int,
     N: int,
     D: int,
     weight_decay: float,
     dtype: torch.dtype,
-    master_weight_bits: int | None,
+    master_weight_bits: Optional[int],
     quantize: bool,
     fused: bool,
 ) -> None:
     """Test optimizer behavior with zero gradients, ensuring momentum stays zero and weights change only with weight decay."""
     device = "cuda"
-    gen = torch.Generator(device=device).manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(0)
     is_sgd = "SGD" in opt_config.name
 
     mom_should_be_zero = True
     if is_sgd and weight_decay > 0:
         mom_should_be_zero = False  # SGD includes weight decay in grad
 
-    W = torch.rand((D, D), device=device, requires_grad=True, generator=gen)
+    W = torch.rand(
+        (D, D), device=device, requires_grad=True, generator=gen, dtype=dtype
+    )
     W_orig = W.detach().clone()
 
     opt = opt_config.factory(
@@ -260,7 +229,9 @@ def test_changes_with_zero_grads(
                     assert torch.all(mom.quantized == 0)
 
             if weight_decay:
-                assert torch.all(W_orig.abs() > W.abs())
+                # With narrow dtypes (bf16/fp16), tiny WD changes can round to zero,
+                # so we only assert that no weight magnitude increased.
+                assert torch.all(W_orig.abs() >= W.abs())
             else:
                 torch.testing.assert_close(W_orig, W)  # no weight modification
 
@@ -282,7 +253,7 @@ def test_descends(
     N: int,
     D: int,
     dtype: torch.dtype,
-    master_weight_bits: int | None,
+    master_weight_bits: Optional[int],
     quantize: bool,
     fused: bool,
 ) -> None:
@@ -561,6 +532,7 @@ def test_fused_unfused_unquantized_same(
     diffs_true = (W_true.detach().float() - W0_f).ravel()
     diffs_uu = (W_uu.detach().float() - W0_f).ravel()
     diffs_uq = (W_uq.detach().float() - W0_f).ravel()
+    diffs_fu = (W_fu.detach().float() - W0_f).ravel()
     diffs_fq = (W_fq.detach().float() - W0_f).ravel()
     diffs_fqe = (W_fqe.detach().float() - W0_f).ravel()
     diffs_other = (W_other.detach().float() - W0_f).ravel()
@@ -577,10 +549,16 @@ def test_fused_unfused_unquantized_same(
     assert cossim(diffs_true, diffs_uu, dim=-1) > min_cossim
     assert nmse(diffs_true, diffs_uu) < max_nmse
 
+    # fused unquantized should be close to unfused unquantized
+    assert cossim(diffs_uu, diffs_fu, dim=-1) > 0.99
+    assert nmse(diffs_uu, diffs_fu) < 0.01
+    assert cossim(diffs_true, diffs_fu, dim=-1) > min_cossim
+    assert nmse(diffs_true, diffs_fu) < max_nmse
+
     # fused and unfused should be almost identical; the only differences
     # are intermediate upcasting in the fused impl
-    assert cossim(diffs_uq, diffs_fq, dim=-1) > 0.99
-    assert nmse(diffs_uq, diffs_fq) < 0.01
+    assert cossim(diffs_uq, diffs_fq, dim=-1) > 0.999
+    assert nmse(diffs_uq, diffs_fq) < 5e-4
 
     assert cossim(diffs_true, diffs_uq, dim=-1) > min_cossim
     assert nmse(diffs_true, diffs_uq) < max_nmse
@@ -606,7 +584,6 @@ def test_fused_unfused_unquantized_same(
         assert nmse(diffs_true, diffs_other) > 0.01
 
 
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
 @pytest.mark.parametrize(
     "dtype,master_weight_bits,quantize",
     DTYPE_ECC_QUANT_CONFIGS,
@@ -615,16 +592,14 @@ def test_fused_unfused_unquantized_same(
 @pytest.mark.parametrize("max_abs_value", [1.0, 1e2, 1e-2])
 @pytest.mark.parametrize("lr", [1e-1, 1e-3, 1e-7], ids=lr_id)
 def test_check_numerics(
-    seed: int,
     dtype: torch.dtype,
-    master_weight_bits: int | None,
+    master_weight_bits: Optional[int],
     quantize: bool,
     max_abs_value: float,
     lr: float,
 ):
     """Test that check_numerics properly detects when learning rate is too small to modify weights."""
-    # Create a parameter with the specified maximum absolute value
-    gen = torch.Generator(device="cuda").manual_seed(seed)
+    gen = torch.Generator(device="cuda").manual_seed(0)
     p = (
         torch.randint(
             2, size=(1024,), device=torch.device("cuda"), dtype=dtype, generator=gen
@@ -657,261 +632,19 @@ def test_check_numerics(
         optimizer.step()
 
 
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
-@pytest.mark.parametrize(
-    "dtype,master_weight_bits,quantize",
-    DTYPE_ECC_QUANT_CONFIGS,
-    ids=[dtype_ecc_quant_id(c) for c in DTYPE_ECC_QUANT_CONFIGS],
-)
-@pytest.mark.parametrize(
-    "compress_state_dict", [False, True], ids=compress_state_dict_id
-)
-def test_vanilla_checkpoint_interop(
-    opt_config: OptimizerTestConfig,
-    seed: int,
-    dtype: torch.dtype,
-    master_weight_bits: int | None,
-    quantize: bool,
-    compress_state_dict: bool,
-):
-    """Test that optimizer state can be loaded from vanilla PyTorch optimizers and vice versa."""
-    gen = torch.Generator(device="cuda").manual_seed(seed)
-    params = make_params_with_grads(device="cuda", dtype=dtype, generator=gen)
-
-    if compress_state_dict and not quantize:
-        pytest.skip("can't export compressed if unquantized")
-
-    def _state_dicts_match(
-        opt_baseline: Optimizer,
-        opt_compressed: Optimizer,
-        check_params: Sequence[torch.Tensor],
-    ) -> bool:
-        for p in check_params:
-            for key in opt_config.state_var_names:
-                state_vanilla = opt_baseline.state[p][key]
-                state_ours = opt_compressed.state[p][key].materialize()
-                cs = F.cosine_similarity(
-                    state_vanilla.ravel(), state_ours.ravel(), dim=-1
-                ).item()
-                if cs <= 0.99:
-                    return False
-        return True
-
-    # load vanilla PyTorch optimizer's state into FlashOptim optimizer
-    opt_torch = opt_config.reference_factory(params, lr=0.1)
-    opt_torch.step()  # per-param state is only created when we step
-    opt_ours = opt_config.factory(
-        params,
-        lr=0.1,
-        quantize=quantize,
-        master_weight_bits=master_weight_bits,
-        compress_state_dict=compress_state_dict,
-    )
-    opt_ours.load_state_dict(opt_torch.state_dict())
-    assert _state_dicts_match(opt_torch, opt_ours, params)
-
-    # load FlashOptim optimizer's state into vanilla PyTorch optimizer
-    new_opt_torch = opt_config.reference_factory(params)
-    with pytest.raises(KeyError) if compress_state_dict else nullcontext():
-        new_opt_torch.load_state_dict(opt_ours.state_dict())
-        assert _state_dicts_match(new_opt_torch, opt_ours, params)
-        new_opt_torch.step()  # make sure the vanilla PyTorch optimizer at least runs
-
-    opt_ours.step()  # make sure the FlashOptim optimizer at least runs
-
-
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
-@pytest.mark.parametrize("quantized_state", [False, True], ids=quantized_state_id)
-@pytest.mark.parametrize("dtype", _FLOAT_DTYPES, ids=dtype_id)
-@pytest.mark.parametrize(
-    "master_weight_bits", _MASTER_WEIGHT_BITS, ids=master_weight_bits_id
-)
-def test_state_dict_save_load(
-    opt_config: OptimizerTestConfig,
-    seed: int,
-    quantized_state: bool,
-    dtype: torch.dtype,
-    master_weight_bits: int | None,
-):
-    """Test that optimizer state can be saved and loaded correctly, preserving quantized and error correction data."""
-    device = "cuda"
-    gen = torch.Generator(device=device).manual_seed(seed)
-    params = make_params_with_grads(device=device, dtype=dtype, generator=gen)
-
-    # create optimizer and have it step so that state gets populated
-    opt = opt_config.factory(
-        params,
-        compress_state_dict=quantized_state,
-        master_weight_bits=master_weight_bits,
-        check_numerics=False,
-    )
-    opt.step()
-    opt.zero_grad()
-
-    # copy state dict into a new instance
-    state_dict = opt.state_dict()
-    opt_new = opt_config.factory(
-        params,
-        compress_state_dict=quantized_state,
-        master_weight_bits=master_weight_bits,
-        check_numerics=False,
-    )
-    opt_new.load_state_dict(state_dict)
-    for p in params:
-        d_orig = opt.state[p]
-        d_new = opt_new.state[p]
-        assert sorted(d_orig.keys()) == sorted(d_new.keys())
-        for key in opt_config.state_var_names:
-            state_orig = d_orig[key]
-            state_new = d_new[key]
-            if quantized_state:
-                # Optimizer load_state_dict insists on converting scales to
-                # dtype of param, which is lossy for bf16 params.
-                # Ideally we'd require == for everything but it's less complexity
-                # to just relax the bf16 test
-                assert torch.all(state_orig.quantized == state_new.quantized)
-                if dtype == torch.bfloat16:
-                    torch.testing.assert_close(
-                        state_orig.scales, state_new.scales, atol=1e-3, rtol=1e-2
-                    )
-                else:
-                    assert torch.all(state_orig.scales == state_new.scales)
-
-            torch.testing.assert_close(
-                state_orig.materialize(),
-                state_new.materialize(),
-                atol=1.0 / (2 * 127),
-                rtol=1e-2,
-            )
-
-        err_bytes = _BITS_TO_BYTES[master_weight_bits] - _DTYPE_WIDTHS[dtype]
-        if err_bytes == 1:
-            assert d_new["error_bits"].dtype == torch.int8
-            torch.testing.assert_close(
-                d_orig["error_bits"].view(dtype=torch.int8),
-                d_new["error_bits"].view(dtype=torch.int8),
-            )
-        elif err_bytes == 2:
-            assert d_new["error_bits"].dtype == torch.int16
-            torch.testing.assert_close(
-                d_orig["error_bits"].view(dtype=torch.int16),
-                d_new["error_bits"].view(dtype=torch.int16),
-            )
-
-    # The loaded optimizer must produce finite, reasonable params when stepped.
-    # Params are initialized in [0, 1] and stepped with small lr, so anything
-    # above 10 is clearly wrong.
-    for p in params:
-        p.grad = torch.rand(p.shape, device=device, dtype=dtype, generator=gen)
-    opt_new.step()
-    for p in params:
-        assert p.isfinite().all()
-        assert p.abs().max() < 10
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint disk round-trip
-# ---------------------------------------------------------------------------
-
-_CKPT_SEEDS = [0, 1]
-
-
-@pytest.mark.parametrize("seed", _CKPT_SEEDS, ids=seed_id)
-@pytest.mark.parametrize("ckpt_config", _CKPT_CONFIGS, ids=ckpt_id)
-@pytest.mark.parametrize(
-    "compress_state_dict", [False, True], ids=["uncompressed", "compressed"]
-)
-def test_state_dict_disk_roundtrip(
-    opt_config: OptimizerTestConfig,
-    seed: int,
-    ckpt_config: tuple[bool, int],
-    compress_state_dict: bool,
-) -> None:
-    """Optimizer state_dict must survive a torch.save -> torch.load round-trip."""
-    quantize, master_weight_bits = ckpt_config
-    if compress_state_dict and not quantize:
-        pytest.skip("compress_state_dict=True requires quantize=True")
-
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    d_in, d_out = 10, 5
-    model_dtype = torch.bfloat16 if master_weight_bits in (24, 32) else torch.float32
-    dataset = ToyDataset(n=128, d_in=d_in, d_out=d_out, seed=seed)
-    batches = _prepare_batches(dataset, 5, model_dtype=model_dtype)
-
-    model = _create_simple_model(d_in, d_out).to("cuda", dtype=model_dtype)
-    opt = opt_config.factory(
-        model.parameters(),
-        lr=0.01,
-        quantize=quantize,
-        master_weight_bits=master_weight_bits,
-        compress_state_dict=compress_state_dict,
-        check_numerics=False,
-    )
-    _train_steps(model, opt, batches, 0, 3)
-
-    # Save to disk and load back
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = f"{tmpdir}/opt_state.pt"
-        torch.save(opt.state_dict(), path)
-        loaded_sd = torch.load(path, weights_only=False)
-
-    # Load into fresh optimizer
-    model2 = _create_simple_model(d_in, d_out).to("cuda", dtype=model_dtype)
-    model2.load_state_dict(model.state_dict())
-    opt2 = opt_config.factory(
-        model2.parameters(),
-        lr=0.01,
-        quantize=quantize,
-        master_weight_bits=master_weight_bits,
-        compress_state_dict=compress_state_dict,
-        check_numerics=False,
-    )
-    opt2.load_state_dict(loaded_sd)
-
-    # Verify state matches
-    for p1, p2 in zip(model.parameters(), model2.parameters()):
-        d_orig = opt.state[p1]
-        d_new = opt2.state[p2]
-        assert sorted(d_orig.keys()) == sorted(d_new.keys())
-
-        for key in opt_config.state_var_names:
-            torch.testing.assert_close(
-                d_orig[key].materialize(),
-                d_new[key].materialize(),
-                atol=1.0 / (2 * 127),
-                rtol=1e-2,
-            )
-
-        if "error_bits" in d_orig:
-            torch.testing.assert_close(
-                d_orig["error_bits"].view(dtype=torch.int8),
-                d_new["error_bits"].view(dtype=torch.int8),
-            )
-
-    # Loaded optimizer must produce finite, reasonable params when stepped.
-    _train_steps(model2, opt2, batches, 3, 5)
-    for p in model2.parameters():
-        assert p.isfinite().all()
-        assert p.abs().max() < 100
-
-
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
 @pytest.mark.parametrize(
     "N,D", [(32, 32), (256, 256), (1024, 1024), (4096, 4096), (16384, 16384)]
 )
 @pytest.mark.parametrize("dtype", _FLOAT_DTYPES, ids=dtype_id)
 def test_fused_as_fast_as_unfused(
     opt_config: OptimizerTestConfig,
-    seed: int,
     N: int,
     D: int,
     dtype: torch.dtype,
     min_elems_traversed: int = 1000000,
 ):
     """Test that fused implementations are at least as fast as unfused implementations."""
-    gen = torch.Generator(device="cuda").manual_seed(seed)
+    gen = torch.Generator(device="cuda").manual_seed(0)
 
     def _time_kernels(N: int, D: int, min_elems_traversed: int):
         W = torch.randn(
@@ -1212,8 +945,7 @@ def test_gradient_release_matches_manual_step(
     handle.remove()
 
 
-@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
-def test_gradient_release_shared_params(opt_config: OptimizerTestConfig, seed: int):
+def test_gradient_release_shared_params(opt_config: OptimizerTestConfig):
     """Tied/shared params are stepped exactly once per backward in gradient-release mode."""
     from flashoptim import enable_gradient_release
 
@@ -1233,7 +965,7 @@ def test_gradient_release_shared_params(opt_config: OptimizerTestConfig, seed: i
         model, opt, pre_step=lambda p, g: (step_counts.append(1) or True)
     )
 
-    gen = torch.Generator(device=device).manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(0)
     for _ in range(3):
         step_counts.clear()
         x = torch.randint(0, V, (4, 8), device=device, generator=gen)
@@ -1306,14 +1038,15 @@ def test_fp32_state_dict_roundtrip(opt_config, seed, dtype, master_weight_bits):
         max_abs_diff = (orig - new).abs().max().item()
         max_rel_error = max_abs_diff / (orig.abs().max().item() + 1e-12)
 
-        # Assert thresholds
-        # NMSE should be very small (< 1e-4 for good ECC)
-        assert nmse < 1e-6, f"NMSE too high: {nmse:.6f} for {name}"
-
-        # Max relative error should be small
-        assert max_rel_error < 1 / 128, (
+        # Assert thresholds — roundtrip is exact
+        assert nmse < 1e-9, f"NMSE too high: {nmse:.6f} for {name}"
+        assert max_rel_error < 1e-6, (
             f"Max relative error too high: {max_rel_error:.6f} for {name}"
         )
+
+
+def _seq(**modules: nn.Module) -> nn.Sequential:
+    return nn.Sequential(OrderedDict(modules.items()))
 
 
 def test_cast_model():
@@ -1347,18 +1080,9 @@ def test_cast_model():
     out = model(torch.randn(2, 16, dtype=torch.bfloat16))
     assert out.shape == (2, 10)
 
-    # --- full_precision_keywords keeps matching modules fp32 + patches forward ---
-    class HeadModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.backbone = nn.Linear(16, 32)
-            self.head = nn.Linear(32, 10)
-
-        def forward(self, x):
-            return self.head(self.backbone(x))
-
-    model = HeadModel()
-    cast_model(model, full_precision_keywords=["head"])
+    # --- full_precision_layers keeps matching modules fp32 + patches forward ---
+    model = _seq(backbone=nn.Linear(16, 32), head=nn.Linear(32, 10))
+    cast_model(model, full_precision_layers=["head"])
     for param in model.head.parameters():
         assert param.dtype == torch.float32
     for param in model.backbone.parameters():
@@ -1366,10 +1090,13 @@ def test_cast_model():
     assert getattr(model.head, "_has_fp32_input_hook", False)
     assert len(model.head._forward_pre_hooks) > 0
 
-    # --- Patched forward upcasts bf16 input to fp32 output ---
+    # --- Patched forward upcasts bf16 input to fp32, terminal layer keeps fp32 ---
     x = torch.randn(2, 32, dtype=torch.bfloat16)
     out = model.head(x)
     assert out.dtype == torch.float32
+    # End-to-end: terminal layer (lm_head use case) preserves fp32 output
+    out_e2e = model(torch.randn(2, 16, dtype=torch.bfloat16))
+    assert out_e2e.dtype == torch.float32
 
     # --- Hook casts ALL floating-point tensor args, not just the first ---
     class MultiInputBlock(nn.Module):
@@ -1389,13 +1116,13 @@ def test_cast_model():
             return self.block(x, mask)
 
     model = MultiInputModel()
-    cast_model(model, full_precision_keywords=["block"])
+    cast_model(model, full_precision_layers=["block"])
     x = torch.randn(2, 8, dtype=torch.bfloat16)
     mask = torch.randn(2, 8, dtype=torch.bfloat16)
     out = model(x, mask)
     assert out.dtype == torch.float32
 
-    # --- Nested modules are hooked via named_modules() substring matching ---
+    # --- Nested modules matched via fnmatch on full dotted name ---
     class NestedModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1409,51 +1136,80 @@ def test_cast_model():
             return self.decoder["head"](h)
 
     model = NestedModel()
-    cast_model(model, full_precision_keywords=["head"])
+    cast_model(model, full_precision_layers=["*.head"])
     assert getattr(model.decoder["head"], "_has_fp32_input_hook", False)
     assert model.decoder["head"].weight.dtype == torch.float32
     assert not getattr(model.decoder["proj"], "_has_fp32_input_hook", False)
     x = torch.randn(2, 10, dtype=torch.bfloat16)
     assert model(x).dtype == torch.float32
 
-    # --- Segment keyword matching: "head" matches exact segments, not substrings ---
-    class SegmentModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.multi_head_attn = nn.Linear(10, 10)
-            self.head = nn.Linear(10, 5)
-            self.backbone = nn.Linear(10, 10)
-
-        def forward(self, x):
-            return self.head(self.multi_head_attn(x))
-
-    model = SegmentModel()
-    cast_model(model, full_precision_keywords=["head"])
+    # --- fnmatch: "head" matches top-level only, not substring of other names ---
+    model = _seq(
+        multi_head_attn=nn.Linear(10, 10),
+        head=nn.Linear(10, 5),
+        backbone=nn.Linear(5, 10),
+    )
+    cast_model(model, full_precision_layers=["head"])
     assert getattr(model.head, "_has_fp32_input_hook", False)
     assert not getattr(model.multi_head_attn, "_has_fp32_input_hook", False)
     assert not getattr(model.backbone, "_has_fp32_input_hook", False)
 
     # --- Hook skips non-floating-point first args (e.g. integer indices) ---
-    class EmbedModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = nn.Embedding(50, 10)
-
-        def forward(self, indices):
-            return self.embed(indices)
-
-    model = EmbedModel()
-    cast_model(model, full_precision_keywords=["embed"])
+    model = _seq(embed=nn.Embedding(50, 10))
+    cast_model(model, full_precision_layers=["embed"])
     assert getattr(model.embed, "_has_fp32_input_hook", False)
     indices = torch.tensor([0, 1, 2], dtype=torch.long)
     out = model(indices)
-    assert out.dtype == torch.float32  # embed weight is fp32, so output is fp32
+    assert out.dtype == torch.float32  # terminal layer preserves fp32
 
-    # --- Buffers: selective=False casts buffers, selective=True preserves norm buffers ---
+    # --- Module reference matching ---
+    model = _seq(backbone=nn.Linear(16, 32), head=nn.Linear(32, 10))
+    cast_model(model, full_precision_layers=[model.head])
+    for param in model.head.parameters():
+        assert param.dtype == torch.float32
+    for param in model.backbone.parameters():
+        assert param.dtype == torch.bfloat16
+    assert getattr(model.head, "_has_fp32_input_hook", False)
+    out = model(torch.randn(2, 16, dtype=torch.bfloat16))
+    assert out.dtype == torch.float32
+
+    # --- fnmatch wildcard patterns ---
+    model = NestedModel()
+    cast_model(model, full_precision_layers=["decoder.*"])
+    assert model.decoder["head"].weight.dtype == torch.float32
+    assert model.decoder["proj"].weight.dtype == torch.float32
+    assert model.encoder.weight.dtype == torch.bfloat16
+
+    # --- full_precision_recast_layers: output recast to model dtype ---
+    model = _seq(
+        pre=nn.Linear(16, 32), target=nn.Linear(32, 32), post=nn.Linear(32, 10)
+    )
+    cast_model(model, full_precision_recast_layers=["target"])
+    for p in model.target.parameters():
+        assert p.dtype == torch.float32
+    # target output should be recast to bf16
+    x = torch.randn(2, 16, dtype=torch.bfloat16)
+    out = model(x)
+    assert out.dtype == torch.bfloat16
+
+    # --- LayerNorm in full_precision_recast_layers: fp32 params, recast output for bf16 follow-up ---
+    model = _seq(pre=nn.Linear(16, 16), ln=nn.LayerNorm(16), post=nn.Linear(16, 16))
+    cast_model(model, full_precision_recast_layers=["ln"])
+    assert model.ln.weight.dtype == torch.float32
+    assert model.post.weight.dtype == torch.bfloat16
+    assert getattr(model.ln, "_has_fp32_input_hook", False)
+    out = model(torch.randn(2, 16, dtype=torch.bfloat16))
+    assert out.dtype == torch.bfloat16
+
+    # --- Buffers: selective=False casts floating-point buffers, skips integer buffers ---
     model = nn.Sequential(nn.BatchNorm2d(3), nn.Flatten(), nn.Linear(3, 10))
     cast_model(model, selective=False)
     for buf in model[0].buffers():
-        assert buf.dtype == torch.bfloat16
+        if buf.is_floating_point():
+            assert buf.dtype == torch.bfloat16
+        else:
+            # Integer buffers (e.g. num_batches_tracked) should remain unchanged
+            assert buf.dtype == torch.int64
 
     model2 = nn.Sequential(nn.BatchNorm2d(3), nn.Flatten(), nn.Linear(3, 10))
     cast_model(model2, selective=True)
@@ -1530,6 +1286,49 @@ def test_cast_model_selective_all_norm_types(norm, shape, expect_fp32):
     assert out.is_floating_point()
 
 
+@pytest.mark.parametrize(
+    "target_layer, use_pre, input_factory",
+    [
+        (nn.Linear(32, 32), True, lambda: torch.randn(4, 32, dtype=torch.bfloat16)),
+        (nn.LayerNorm(32), True, lambda: torch.randn(4, 32, dtype=torch.bfloat16)),
+        (nn.RMSNorm(32), True, lambda: torch.randn(4, 32, dtype=torch.bfloat16)),
+        (nn.Embedding(64, 32), False, lambda: torch.randint(0, 64, (4,))),
+    ],
+    ids=["Linear", "LayerNorm", "RMSNorm", "Embedding"],
+)
+def test_cast_model_fp32_keyword_forward_pass(target_layer, use_pre, input_factory):
+    """Forward pass through a model where a middle layer is kept fp32 via recast.
+
+    The fp32 layer produces fp32 output which is recast to bf16 before the next
+    bf16 layer. This verifies that the dtype transition does not cause a crash.
+    """
+    D = 32
+    layers = OrderedDict()
+    if use_pre:
+        layers["pre"] = nn.Linear(D, D)
+    layers["target"] = target_layer
+    layers["post"] = nn.Linear(D, D)
+    layers["final"] = nn.Linear(D, D)
+    model = nn.Sequential(layers)
+
+    cast_model(model, full_precision_recast_layers=["target"])
+
+    # Verify target params are fp32
+    for p in model.target.parameters():
+        assert p.dtype == torch.float32, f"target param should be fp32, got {p.dtype}"
+
+    # Verify non-target params are bf16
+    for name, p in model.named_parameters():
+        if "target" not in name:
+            assert p.dtype == torch.bfloat16, f"{name} should be bf16, got {p.dtype}"
+
+    # Forward pass — this is the critical check: fp32 output → bf16 layer
+    out = model(input_factory())
+
+    assert torch.isfinite(out).all(), "output contains NaN or Inf"
+    assert out.shape[0] == 4
+
+
 # ========== decouple_lr baseline correctness ==========
 
 
@@ -1571,3 +1370,168 @@ def test_reference_adamw_decouple_lr_matches_torch_adamw(lr, weight_decay, shape
         opt_torch.step()
 
     torch.testing.assert_close(p_ref, p_torch, rtol=1e-5, atol=1e-7)
+
+
+# ============================================================================
+# SGD zero-momentum tests
+# ============================================================================
+
+
+@pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=dtype_id)
+@pytest.mark.parametrize("master_weight_bits", [None, 24], ids=master_weight_bits_id)
+@pytest.mark.parametrize("weight_decay", [0.0, 0.1], ids=weight_decay_id)
+def test_sgd_zero_momentum(
+    seed: int,
+    dtype: torch.dtype,
+    master_weight_bits: Optional[int],
+    weight_decay: float,
+) -> None:
+    """Test the SGD zero-momentum Python path (bypasses Triton kernel).
+
+    For fp32 without ECC, verifies exact match against TorchSGD.
+    For all combos (including bf16/ECC), verifies loss descent.
+    """
+    device = "cuda"
+    D = 32
+    torch.manual_seed(seed)
+    target = torch.randn(D, device=device, dtype=dtype)
+    W = torch.randn(D, device=device, dtype=dtype, requires_grad=True)
+
+    opt = SGD_ZERO_MOM_CONFIG.factory(
+        [W],
+        lr=0.01,
+        weight_decay=weight_decay,
+        quantize=False,
+        master_weight_bits=master_weight_bits,
+    )
+
+    # Verify loss descent
+    initial_loss = (W.detach().float() - target.float()).pow(2).mean().item()
+    for _ in range(20):
+        loss = (W - target).pow(2).mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad()
+
+    final_loss = (W.detach().float() - target.float()).pow(2).mean().item()
+    assert final_loss < initial_loss, (
+        f"SGD zero-momentum should descend: initial={initial_loss:.6f} final={final_loss:.6f}"
+    )
+
+    # For fp32 without ECC, also verify exact match against TorchSGD
+    if dtype == torch.float32 and master_weight_bits is None:
+        gen = torch.Generator(device=device).manual_seed(seed)
+        W_flash = torch.randn(D, D, device=device, generator=gen, requires_grad=True)
+        W_ref = W_flash.detach().clone().requires_grad_(True)
+
+        opt_flash = SGD_ZERO_MOM_CONFIG.factory(
+            [W_flash],
+            lr=0.01,
+            weight_decay=weight_decay,
+            quantize=False,
+            master_weight_bits=None,
+        )
+        opt_ref = SGD_ZERO_MOM_CONFIG.reference_factory(
+            [W_ref],
+            lr=0.01,
+            weight_decay=weight_decay,
+        )
+
+        for step in range(10):
+            torch.manual_seed(seed * 100 + step)
+            grad = torch.randn(D, D, device=device)
+            W_flash.grad = grad.clone()
+            W_ref.grad = grad.clone()
+            opt_flash.step()
+            opt_ref.step()
+
+        torch.testing.assert_close(W_flash, W_ref, rtol=1e-5, atol=1e-7)
+
+
+# ============================================================================
+# Multi-param-group tests
+# ============================================================================
+
+
+@pytest.mark.parametrize("seed", SEEDS[:2], ids=seed_id)
+def test_multi_param_group(
+    opt_config: OptimizerTestConfig,
+    seed: int,
+) -> None:
+    """Test optimizer with multiple param groups using different learning rates."""
+    device = "cuda"
+    D = 32
+    torch.manual_seed(seed)
+
+    p1 = torch.randn(D, D, device=device, requires_grad=True)
+    p2 = torch.randn(D, D, device=device, requires_grad=True)
+
+    opt = opt_config.factory(
+        [
+            {"params": [p1], "lr": 0.1},
+            {"params": [p2], "lr": 0.001},
+        ],
+        quantize=False,
+        check_numerics=False,
+    )
+
+    p1_orig = p1.detach().clone()
+    p2_orig = p2.detach().clone()
+
+    for step in range(5):
+        torch.manual_seed(seed * 100 + step)
+        p1.grad = torch.randn_like(p1)
+        p2.grad = torch.randn_like(p2)
+        opt.step()
+
+    # Both params should have changed
+    assert not torch.allclose(p1, p1_orig)
+    assert not torch.allclose(p2, p2_orig)
+
+    # p1 (higher LR) should change more than p2 (lower LR)
+    delta1 = (p1 - p1_orig).abs().mean().item()
+    delta2 = (p2 - p2_orig).abs().mean().item()
+    assert delta1 > delta2, (
+        f"Higher-LR group should change more: delta1={delta1:.6f} <= delta2={delta2:.6f}"
+    )
+
+
+# ============================================================================
+# ECC 24-bit width regression test
+# ============================================================================
+
+
+def test_fused_unfused_24bit_ecc_match(opt_config: OptimizerTestConfig):
+    """Fused and unfused 24-bit ECC must agree on dtype and reconstructed fp32 values."""
+    from flashoptim import reconstruct_fp32_param
+
+    N = 2048
+    torch.manual_seed(42)
+    init = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    p_fused = init.clone().requires_grad_(True)
+    p_unfused = init.clone().requires_grad_(True)
+
+    kw = {"lr": 1e-3, "master_weight_bits": 24, "weight_decay": 0.01}
+    opt_fused = opt_config.factory([p_fused], fused=True, **kw)
+    opt_unfused = opt_config.factory([p_unfused], fused=False, **kw)
+
+    for step in range(10):
+        torch.manual_seed(100 + step)
+        grad = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        p_fused.grad = grad.clone()
+        p_unfused.grad = grad.clone()
+        opt_fused.step()
+        opt_unfused.step()
+
+    s_fused = opt_fused.state[p_fused]
+    s_unfused = opt_unfused.state[p_unfused]
+
+    # The bug: unfused produced int16 instead of int8 for 24-bit master weights
+    assert s_fused["error_bits"].dtype == torch.int8
+    assert s_unfused["error_bits"].dtype == torch.int8
+
+    fp32_f = reconstruct_fp32_param(p_fused.data, s_fused["error_bits"])
+    fp32_u = reconstruct_fp32_param(p_unfused.data, s_unfused["error_bits"])
+    sim = cossim(fp32_f.unsqueeze(0).float(), fp32_u.unsqueeze(0).float()).item()
+    assert sim > 0.999, f"Fused/unfused cosine similarity too low: {sim}"

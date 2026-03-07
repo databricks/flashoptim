@@ -25,7 +25,7 @@ import weakref
 from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, Callable, Literal, Optional, cast
+from typing import Any, Callable, Literal, Optional, Union, cast
 
 import torch
 import torch.nn as nn
@@ -118,18 +118,35 @@ class _MaybeQuantizedTensor:
         signed: bool = True,
         sqrt: bool = False,
         softsign: bool = True,
+        storage_dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        self.data: Optional[torch.Tensor] = None
-        self.quantized: Optional[torch.Tensor] = None
-        self.scales: Optional[torch.Tensor] = None
+        self._data: Optional[torch.Tensor] = None
+        self._quantized: Optional[torch.Tensor] = None
+        self._scales: Optional[torch.Tensor] = None
         self._try_quantize = try_quantize and torch.cuda.is_available()
         self._signed = signed
         self._sqrt = sqrt
         self._softsign = softsign
+        self._storage_dtype: torch.dtype = storage_dtype
 
         if data is not None:
             self.set_data(data)
+
+    @property
+    def data(self) -> torch.Tensor:
+        assert self._data is not None
+        return self._data
+
+    @property
+    def quantized(self) -> torch.Tensor:
+        assert self._quantized is not None
+        return self._quantized
+
+    @property
+    def scales(self) -> torch.Tensor:
+        assert self._scales is not None
+        return self._scales
 
     @staticmethod
     def _quantized_vals_key(name: str) -> str:
@@ -158,9 +175,15 @@ class _MaybeQuantizedTensor:
         signed: bool = True,
         sqrt: bool = False,
         softsign: bool = True,
+        storage_dtype: torch.dtype = torch.float32,
     ) -> "_MaybeQuantizedTensor":
         obj = cls(
-            None, try_quantize=try_quantize, signed=signed, sqrt=sqrt, softsign=softsign
+            None,
+            try_quantize=try_quantize,
+            signed=signed,
+            sqrt=sqrt,
+            softsign=softsign,
+            storage_dtype=storage_dtype,
         )
         obj.load_state_dict(d, name)
         return obj
@@ -179,10 +202,10 @@ class _MaybeQuantizedTensor:
             return
 
         target_dtype = torch.int8 if self._signed else torch.uint8
-        self.quantized = d[_MaybeQuantizedTensor._quantized_vals_key(name)].to(
+        self._quantized = d[_MaybeQuantizedTensor._quantized_vals_key(name)].to(
             dtype=target_dtype
         )
-        self.scales = d[_MaybeQuantizedTensor._quantized_scales_key(name)].to(
+        self._scales = d[_MaybeQuantizedTensor._quantized_scales_key(name)].to(
             dtype=torch.float16
         )
 
@@ -193,17 +216,17 @@ class _MaybeQuantizedTensor:
                     f"Attempting to quantize a non-CUDA {data.dtype} tensor "
                     + f"on device {data.device} with shape {data.shape}."
                 )
-            self.data = None
-            self.quantized, self.scales = quantize(
+            self._data = None
+            self._quantized, self._scales = quantize(
                 data, signed=self._signed, sqrt=self._sqrt, softsign=self._softsign
             )
         else:
-            self.data = data.to(dtype=torch.float32)
-            self.quantized = None
-            self.scales = None
+            self._data = data.to(dtype=self._storage_dtype)
+            self._quantized = None
+            self._scales = None
 
     def is_quantized(self) -> bool:
-        return self.data is None
+        return self._data is None
 
     def materialize(self) -> torch.Tensor:
         if not self.is_quantized():
@@ -246,9 +269,7 @@ class _MaybeQuantizedTensor:
         Returns quantized int8/uint8 tensor if quantized, else fp32 data tensor.
         """
         if self.is_quantized():
-            assert self.quantized is not None
             return self.quantized
-        assert self.data is not None
         return self.data
 
     @property
@@ -260,7 +281,6 @@ class _MaybeQuantizedTensor:
         even for unused parameters).
         """
         if self.is_quantized():
-            assert self.scales is not None
             return self.scales
         return self.kernel_tensor
 
@@ -384,6 +404,11 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             (1 byte/param) and 32 adds an INT16 correction tensor
             (2 bytes/param). Set to None to disable and use native parameter
             precision. Supported: {None, 24, 32}.
+        fused: If True (default), each optimizer step runs inside a single
+            Triton kernel. Set to False to run the optimizer arithmetic as
+            eager PyTorch operations; quantization and dequantization of
+            optimizer states still use Triton kernels. Mainly useful for
+            debugging.
         check_numerics: If true, will check that the learning rate is large
             enough to perturb the largest values in each tensor to a different
             bit string (i.e., not ignore the update). This calculation takes
@@ -395,9 +420,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             and after loading a state dict.
     .. NOTE:
 
-        Because `check_numerics` recomputes the parameter standard deviations
+        Because `check_numerics` recomputes the parameter statistics (maxabs)
         during load_state_dict(), it is possible that saving and reloading a
-        checkpoint might result in a new `NumericsError` error appearing. Call
+        checkpoint might result in a new `NumericsError` appearing. Call
         recompute_param_stats() before saving a checkpoint to avoid this
         discrepancy, or simply set `check_numerics=False`.
 
@@ -423,10 +448,11 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         ValueError - If the hyperparameters fail sanity checks, such as
             having a learning rate greater than zero.
         NotImplementedError - If any of `quantize`, `compress_state_dict`,
-            or `error_correction` are `True` and either a) there is no CUDA
-            device, or b) step() is executed on a non-CUDA parameter.
-        NumericsError - If check_numerics is True and estimates
-            that the learning rate is too small to alter the weights.
+            `master_weight_bits`, or `fused` are enabled and either a) there
+            is no CUDA device, or b) step() is executed on a non-CUDA
+            parameter.
+        NumericsError - If check_numerics is True and estimates that the
+            learning rate is too small to alter the weights.
     """
 
     def __init__(
@@ -435,7 +461,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         lr: float = 1e-3,
         quantize: bool = True,
         compress_state_dict: bool = False,
-        master_weight_bits: Literal[24, 32] | None = 24,
+        master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
         # defaults is here so subclasses can pass custom hparams to their
@@ -506,6 +532,25 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     "Please omit master_weight_bits (or set it to None)."
                 )
 
+        # Warn when master_weight_bits=None with low-precision params: this
+        # means pure low-precision training with no error correction, which
+        # is numerically fragile.
+        if master_weight_bits is None:
+            any_low_prec = any(
+                p.dtype != torch.float32
+                for group in self.param_groups
+                for p in group["params"]
+            )
+            if any_low_prec:
+                warnings.warn(
+                    "master_weight_bits=None with non-fp32 parameters means "
+                    "pure low-precision training (no error correction). "
+                    "Optimizer states will be stored at parameter precision. "
+                    "This is numerically fragile, consider setting "
+                    "master_weight_bits=24 for stable training.",
+                    stacklevel=2,
+                )
+
     def __repr__(self) -> str:
         header = f"{self.__class__.__name__} (\n"
         header += "FlashOptim Config\n"
@@ -570,6 +615,44 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             return tensor.to_local()
         return tensor
 
+    @staticmethod
+    def _wrap_state_as_dtensor(state: dict[str, Any], param: torch.Tensor) -> None:
+        """Wrap plain state tensors as DTensors matching param's distribution.
+
+        DCP requires optimizer state tensors to carry the same DTensor metadata
+        (mesh, placements) as their corresponding parameters. Without this,
+        DCP treats local shards as replicated data and scrambles them on load.
+        """
+        if not hasattr(param, "device_mesh"):
+            return
+        from torch.distributed.tensor import DTensor
+
+        mesh = param.device_mesh
+        placements = param.placements
+
+        # Reject uneven shards — DTensor.from_local infers global shape as
+        # local_size * world_size, which is only correct for even splits.
+        for mesh_dim, placement in enumerate(placements):
+            if hasattr(placement, "dim"):
+                shard_dim = placement.dim
+                mesh_size = mesh.size(mesh_dim)
+                if param.shape[shard_dim] % mesh_size != 0:
+                    raise ValueError(
+                        f"DCP checkpointing requires evenly-sharded parameters, "
+                        f"but parameter with shape {param.shape} is unevenly "
+                        f"sharded on dim {shard_dim} across {mesh_size} ranks. "
+                        f"Pad or reshape the parameter so that shape[{shard_dim}] "
+                        f"is divisible by {mesh_size}."
+                    )
+
+        for key, val in state.items():
+            if (
+                isinstance(val, torch.Tensor)
+                and not isinstance(val, DTensor)
+                and val.dim() > 0
+            ):
+                state[key] = DTensor.from_local(val, mesh, placements)
+
     def _recompute_stats_for_param(self, p: torch.Tensor) -> None:
         p_for_stats = self._get_tensor_for_stats(p)
         maxabs = (
@@ -593,19 +676,28 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
     def step_param(
         self,
         p: torch.Tensor,
-        group: dict[str, Any] | None = None,
+        group: Optional[dict[str, Any]] = None,
     ) -> None:
+        """Perform a single optimizer step for one parameter.
+
+        This is the main entry point used by both :meth:`step` (which loops
+        over all parameters) and gradient-release hooks (which call it
+        per-parameter as gradients become available).
+
+        Args:
+            p: The parameter tensor to update. Must already carry a gradient
+                (``p.grad is not None``) for the update to take effect.
+            group: The parameter group dict for *p*.  When ``None``, the
+                group is looked up automatically.
+
+        Raises:
+            RuntimeError: If ``fused=True`` and *p* or its gradient is not
+                contiguous.
+            NumericsError: If ``check_numerics=True`` and the learning rate
+                is too small to alter the weights (see :class:`NumericsError`).
+        """
         if group is None:
             group = self._find_group(p)
-
-        quantize = group.get("quantize", self._quantize)
-        if quantize and not p.is_cuda:
-            raise NotImplementedError(
-                f"Can't use quantization with param on {p.device} "
-                + f"({p.shape}, {p.dtype}). If you need to use this class "
-                + "without a CUDA device, try creating it with "
-                + "quantize=False."
-            )
 
         self._ensure_state_initialized(p, hparams=group)
         param_state = self.state[p]
@@ -633,7 +725,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # DTensors are distributed tensors that can't be passed to Triton directly.
         # to_local() returns a view of the local shard, so in-place ops work correctly.
         p_local = self._get_local_tensor(p)
-        grad_local = self._get_local_tensor(p.grad) if p.grad is not None else None
+        # p.grad is guaranteed non-None by the early return above
+        assert p.grad is not None
+        grad_local = self._get_local_tensor(p.grad)
 
         # Triton kernels use flat pointer arithmetic (ptr + offset) which
         # assumes contiguous memory. Non-contiguous tensors (e.g. transposed
@@ -645,14 +739,14 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     f"but got param with shape {p_local.shape} and stride {p_local.stride()}. "
                     f"Call .contiguous() on the parameter or use fused=False."
                 )
-            if grad_local is not None and not grad_local.is_contiguous():
+            if not grad_local.is_contiguous():
                 raise RuntimeError(
                     f"FlashOptimizer fused kernels require contiguous gradients, "
                     f"but got grad with shape {grad_local.shape} and stride {grad_local.stride()}. "
                     f"Use fused=False for non-contiguous gradients."
                 )
 
-        errors: torch.Tensor | None = None
+        errors: Optional[torch.Tensor] = None
         if "error_bits" in param_state:
             errors = param_state["error_bits"]
 
@@ -673,7 +767,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         )
 
     @torch.no_grad()
-    def step(self, closure: Callable | None = None) -> torch.Tensor | None:
+    def step(self, closure: Optional[Callable] = None) -> Optional[torch.Tensor]:
         if self._gradient_release:
             warnings.warn(
                 "optimizer.step() is a no-op while enable_gradient_release() is active — "
@@ -730,6 +824,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     signed=spec.signed,
                     sqrt=spec.sqrt,
                     softsign=spec.softsign,
+                    storage_dtype=param.dtype,
                 )
                 new_state[key_quant] = qtensor
 
@@ -775,7 +870,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         param_number: int,
         opt_state: dict[int, Any],
         hparams: dict[str, Any],
-        param_dtype_map: dict[int, torch.dtype],
+        idx_to_param: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
         # Make a copy so that we don't mutate our self.state. `opt_state`
         # isn't the same as self.state, but its consituent dicts are
@@ -806,7 +901,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             # states to the param dtype, we have to carefully change the
             # dtypes if the errors and params don't have the same bitwidth.
             # The goal here is to make Optimizer's cast op a no-op.
-            param_dtype = param_dtype_map[param_number]
+            param_dtype = idx_to_param[param_number].dtype
             param_bytewidth = _DTYPE_WIDTHS[param_dtype]
             error_bytewidth = hparams["master_bytewidth"] - param_bytewidth
             errs = param_state["error_bits"]
@@ -827,17 +922,23 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     + "behaviors simultaneously without information loss "
                     + "(or far more implementation complexity)."
                 )
+        # Wrap state tensors as DTensors for DCP compatibility
+        self._wrap_state_as_dtensor(param_state, idx_to_param[param_number])
         return param_state
 
-    def __setstate__(self, state: dict[str, dict[Any, Any]]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         opt_state = state["state"]
         param_groups = state["param_groups"]
-        # Can't assert because dict[...] is not a concrete type.
         opt_state = cast(dict[torch.Tensor, Any], opt_state)
         param_groups = cast(list[dict[str, Any]], param_groups)
         for group in param_groups:
             for param in group["params"]:
                 assert isinstance(param, torch.Tensor)
+                # Unwrap DTensors to local tensors (Triton kernel requirement)
+                param_state = opt_state[param]
+                for key, val in param_state.items():
+                    if isinstance(val, torch.Tensor):
+                        param_state[key] = self._get_local_tensor(val)
                 opt_state[param] = self._load_state_for_param(
                     param, opt_state, hparams=group
                 )
@@ -852,11 +953,11 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         opt_state = d["state"]
         param_groups = d["param_groups"]
 
-        # Build param index -> dtype mapping without mutating self.state
-        param_dtype_map: dict[int, torch.dtype] = {}
+        # Build param index -> param mapping without mutating self.state
+        idx_to_param: dict[int, torch.Tensor] = {}
         for orig_group, saved_group in zip(self.param_groups, param_groups):
             for param, idx in zip(orig_group["params"], saved_group["params"]):
-                param_dtype_map[idx] = param.dtype
+                idx_to_param[idx] = param
 
         for group in param_groups:
             for param_number in group["params"]:
@@ -865,7 +966,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     param_number,
                     opt_state=opt_state,
                     hparams=group,
-                    param_dtype_map=param_dtype_map,
+                    idx_to_param=idx_to_param,
                 )
 
         return d
@@ -908,6 +1009,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                     signed=spec.signed,
                     sqrt=spec.sqrt,
                     softsign=spec.softsign,
+                    storage_dtype=p_local.dtype,
                 )
 
         # Part 3: initialize master weight error correction if needed.
@@ -959,7 +1061,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             >>> # Now model_fp32 has reconstructed fp32 weights for inference
         """
         # Handle DDP wrapper
-        model_to_use = model.module if hasattr(model, "module") else model
+        model_to_use = cast(
+            nn.Module, model.module if hasattr(model, "module") else model
+        )
 
         # Start with the full model state dict (includes parameters and buffers)
         fp32_state = {
@@ -1005,7 +1109,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             >>> optimizer.set_fp32_model_state_dict(model, fp32_state)
         """
         # Handle DDP wrapper
-        model_to_use = model.module if hasattr(model, "module") else model
+        model_to_use = cast(
+            nn.Module, model.module if hasattr(model, "module") else model
+        )
 
         # Update each parameter and its ECC state
         for name, param in model_to_use.named_parameters():
@@ -1013,6 +1119,10 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 continue
 
             fp32_value = fp32_state_dict[name]
+            if fp32_value.dtype != torch.float32:
+                raise ValueError(
+                    f"Expected fp32 value for '{name}', got {fp32_value.dtype}."
+                )
 
             # FSDP2: extract local tensors from DTensors. Triton kernels and
             # in-place copy_ cannot operate on DTensors directly.
@@ -1029,7 +1139,12 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             # Update optimizer ECC state if present
             state = self.state.get(param, {})
             if "error_bits" in state:
-                state["error_bits"] = compute_ecc_bits(local_fp32, local_param)
+                master_bytewidth = (
+                    local_param.element_size() + state["error_bits"].element_size()
+                )
+                state["error_bits"] = compute_ecc_bits(
+                    local_fp32, local_param, master_bytewidth=master_bytewidth
+                )
 
     def _check_param_numerics(
         self, p: torch.Tensor, lr: float, master_bytewidth: int
@@ -1080,7 +1195,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             param: The parameter tensor to update.
             grad: The gradient of the parameter to use for the update.
             errors: Optional error correction bits for the parameter.
-            state: The optimizer state for the parameter (as opposed to the
+            param_state: The optimizer state for the parameter (as opposed to the
                 optimizer state for the entire optimizer, which is self.state).
             hparams: Hyperparameters for the optimizer step, such as learning
                 rate, betas, etc. These are taken from the parameter group.
@@ -1105,8 +1220,24 @@ class FlashLion(FlashOptimizer):
     See the LION paper (https://arxiv.org/abs/2302.06675) for details about
     the algorithm itself.
 
-    See FlashOptimizer for details about the non-LION specific arguments
-    and behavior of this class.
+    See :class:`FlashOptimizer` for details about the non-LION specific
+    arguments and behaviour of this class.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr: Learning rate (default: 1e-3).
+        betas: Coefficients for computing the update and running average of
+            the gradient. ``beta1`` interpolates the update, ``beta2``
+            controls the momentum EMA (default: (0.9, 0.99)).
+        weight_decay: Decoupled weight decay coefficient (default: 0).
+        decouple_lr: If True, weight decay is scaled by ``lr / initial_lr``
+            instead of ``lr`` (default: False).
+        quantize: See :class:`FlashOptimizer`.
+        compress_state_dict: See :class:`FlashOptimizer`.
+        master_weight_bits: See :class:`FlashOptimizer`.
+        check_numerics: See :class:`FlashOptimizer`.
+        fused: See :class:`FlashOptimizer`.
 
     * https://github.com/mosaicml/llm-foundry/blob/6c0d864916cf943314c47061e62efb381083e394/llmfoundry/optim/lion.py#L19
     """
@@ -1118,7 +1249,11 @@ class FlashLion(FlashOptimizer):
         betas: tuple[float, float] = (0.9, 0.99),
         weight_decay: float = 0,
         decouple_lr: bool = False,
-        **kwargs: Any,
+        quantize: bool = True,
+        compress_state_dict: bool = False,
+        master_weight_bits: Literal[24, 32] | None = 24,
+        check_numerics: bool = False,
+        fused: bool = True,
     ):
         if not 0.0 <= betas[0] <= 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
@@ -1128,7 +1263,16 @@ class FlashLion(FlashOptimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         self._decouple_lr = decouple_lr
         defaults = {"betas": betas, "weight_decay": weight_decay}
-        super().__init__(params=params, lr=lr, defaults=defaults, **kwargs)
+        super().__init__(
+            params=params,
+            lr=lr,
+            defaults=defaults,
+            quantize=quantize,
+            compress_state_dict=compress_state_dict,
+            master_weight_bits=master_weight_bits,
+            check_numerics=check_numerics,
+            fused=fused,
+        )
 
     def _quantized_state_spec(self) -> dict[str, QuantizedTensorSpec]:
         return {"exp_avg": QuantizedTensorSpec(signed=True)}
@@ -1188,7 +1332,11 @@ class FlashLion(FlashOptimizer):
 
         param.copy_(param_f32.to(param.dtype))
         if errors is not None:
-            errors.copy_(compute_ecc_bits(param_f32, param))
+            errors.copy_(
+                compute_ecc_bits(
+                    param_f32, param, master_bytewidth=hparams["master_bytewidth"]
+                )
+            )
 
         mom_f32.lerp_(grad_f32, 1.0 - beta2)
         momentums.set_data(mom_f32)
@@ -1198,10 +1346,26 @@ class FlashLion(FlashOptimizer):
 
 
 class FlashSGD(FlashOptimizer):
-    """Drop-in replacement for torch.optim.SGD with L2 regularisation.
+    """Drop-in replacement for ``torch.optim.SGD`` with L2 regularisation.
 
-    See torch.optim.SGD and FlashOptimizer for argument details.
     For decoupled weight decay, use :class:`FlashSGDW`.
+    See :class:`FlashOptimizer` for the non-SGD specific arguments.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr: Learning rate (default: 0.001).
+        momentum: Momentum factor (default: 0).
+        dampening: Dampening for momentum (default: 0).
+        weight_decay: L2 regularisation coefficient applied to the
+            gradient (default: 0).
+        nesterov: Enables Nesterov momentum (default: False). Requires
+            ``momentum > 0`` and ``dampening == 0``.
+        quantize: See :class:`FlashOptimizer`.
+        compress_state_dict: See :class:`FlashOptimizer`.
+        master_weight_bits: See :class:`FlashOptimizer`.
+        check_numerics: See :class:`FlashOptimizer`.
+        fused: See :class:`FlashOptimizer`.
     """
 
     def __init__(
@@ -1212,7 +1376,11 @@ class FlashSGD(FlashOptimizer):
         dampening: float = 0.0,
         weight_decay: float = 0.0,
         nesterov: bool = False,
-        **kwargs: Any,
+        quantize: bool = True,
+        compress_state_dict: bool = False,
+        master_weight_bits: Literal[24, 32] | None = 24,
+        check_numerics: bool = False,
+        fused: bool = True,
     ):
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
@@ -1227,7 +1395,16 @@ class FlashSGD(FlashOptimizer):
             "dampening": dampening,
             "weight_decay": weight_decay,
         }
-        super().__init__(params, lr=lr, defaults=defaults, **kwargs)
+        super().__init__(
+            params,
+            lr=lr,
+            defaults=defaults,
+            quantize=quantize,
+            compress_state_dict=compress_state_dict,
+            master_weight_bits=master_weight_bits,
+            check_numerics=check_numerics,
+            fused=fused,
+        )
 
     def _quantized_state_spec(self) -> dict[str, QuantizedTensorSpec]:
         use_momentum = any(g["momentum"] > 0.0 for g in self.param_groups)
@@ -1280,7 +1457,11 @@ class FlashSGD(FlashOptimizer):
 
             param.copy_(param_f32.to(param.dtype))
             if errors is not None:
-                errors.copy_(compute_ecc_bits(param_f32, param))
+                errors.copy_(
+                    compute_ecc_bits(
+                        param_f32, param, master_bytewidth=hparams["master_bytewidth"]
+                    )
+                )
             return
 
         # if we get to here, we're using momentum
@@ -1322,12 +1503,16 @@ class FlashSGD(FlashOptimizer):
 
             param.copy_(param_f32.to(param.dtype))
             if errors is not None:
-                errors.copy_(compute_ecc_bits(param_f32, param))
+                errors.copy_(
+                    compute_ecc_bits(
+                        param_f32, param, master_bytewidth=hparams["master_bytewidth"]
+                    )
+                )
             mom.set_data(mom_f32)
 
 
 def _ecc_kernel_params(
-    errors: torch.Tensor | None, param: torch.Tensor
+    errors: Optional[torch.Tensor], param: torch.Tensor
 ) -> tuple[bool, int, torch.Tensor, "tl.constexpr"]:
     if errors is None:
         return False, 0, param, tl.int8
@@ -1339,7 +1524,9 @@ def _ecc_kernel_params(
     raise ValueError(f"Errors must have width 1 or 2, not {elem_sz}.")
 
 
-def _read_param_fp32(param: torch.Tensor, errors: torch.Tensor | None) -> torch.Tensor:
+def _read_param_fp32(
+    param: torch.Tensor, errors: Optional[torch.Tensor]
+) -> torch.Tensor:
     if errors is not None:
         return reconstruct_fp32_param(param, errors)
     return param.to(dtype=torch.float32)
@@ -1528,7 +1715,7 @@ def _triton_momentum_kernel(
                 scales_ptr + scales_offsets, absmaxs.to(tl.float16), mask=scales_mask
             )
         else:
-            # Store momentum directly in full precision
+            # Store momentum at param precision
             tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
 
 
@@ -1541,6 +1728,22 @@ class FlashSGDW(FlashSGD):
     By default uses standard decoupled weight decay (scaled by ``lr``).
     Set ``decouple_lr=True`` for fully LR-decoupled weight decay
     (scaled by ``lr_t / lr_initial``).
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr: Learning rate (default: 0.001).
+        momentum: Momentum factor (default: 0).
+        dampening: Dampening for momentum (default: 0).
+        weight_decay: Decoupled weight decay coefficient (default: 0).
+        nesterov: Enables Nesterov momentum (default: False).
+        decouple_lr: If True, weight decay is scaled by ``lr / initial_lr``
+            instead of ``lr`` (default: False).
+        quantize: See :class:`FlashOptimizer`.
+        compress_state_dict: See :class:`FlashOptimizer`.
+        master_weight_bits: See :class:`FlashOptimizer`.
+        check_numerics: See :class:`FlashOptimizer`.
+        fused: See :class:`FlashOptimizer`.
     """
 
     def __init__(
@@ -1554,7 +1757,7 @@ class FlashSGDW(FlashSGD):
         decouple_lr: bool = False,
         quantize: bool = True,
         compress_state_dict: bool = False,
-        master_weight_bits: Literal[24, 32] | None = 24,
+        master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
     ):
@@ -1579,6 +1782,28 @@ class FlashSGDW(FlashSGD):
 
 
 class FlashAdam(FlashOptimizer):
+    """Adam optimizer with L2 regularisation (coupled weight decay).
+
+    Uses ``grad += weight_decay * param`` like ``torch.optim.Adam``.
+    For decoupled weight decay (AdamW), use :class:`FlashAdamW`.
+    See :class:`FlashOptimizer` for the non-Adam specific arguments.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr: Learning rate (default: 1e-3).
+        betas: Coefficients for computing running averages of the gradient
+            and its square (default: (0.9, 0.999)).
+        eps: Term added to the denominator for numerical stability
+            (default: 1e-8).
+        weight_decay: L2 regularisation coefficient (default: 0).
+        quantize: See :class:`FlashOptimizer`.
+        compress_state_dict: See :class:`FlashOptimizer`.
+        master_weight_bits: See :class:`FlashOptimizer`.
+        check_numerics: See :class:`FlashOptimizer`.
+        fused: See :class:`FlashOptimizer`.
+    """
+
     def __init__(
         self,
         params: Iterable[torch.Tensor],
@@ -1586,16 +1811,12 @@ class FlashAdam(FlashOptimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
-        **kwargs: Any,
+        quantize: bool = True,
+        compress_state_dict: bool = False,
+        master_weight_bits: Literal[24, 32] | None = 24,
+        check_numerics: bool = False,
+        fused: bool = True,
     ):
-        """Adam optimizer with L2 regularisation (coupled weight decay).
-
-        Uses ``grad += weight_decay * param`` like ``torch.optim.Adam``.
-        For decoupled weight decay (AdamW), use :class:`FlashAdamW`.
-
-        Args:
-            weight_decay: L2 regularisation coefficient (default 0).
-        """
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps}")
         if not 0.0 <= betas[0] <= 1.0:
@@ -1611,7 +1832,16 @@ class FlashAdam(FlashOptimizer):
             "weight_decay": weight_decay,
             "eps": eps,
         }
-        super().__init__(params=params, lr=lr, defaults=defaults, **kwargs)
+        super().__init__(
+            params=params,
+            lr=lr,
+            defaults=defaults,
+            quantize=quantize,
+            compress_state_dict=compress_state_dict,
+            master_weight_bits=master_weight_bits,
+            check_numerics=check_numerics,
+            fused=fused,
+        )
 
     def _ensure_state_initialized(
         self, p: torch.Tensor, hparams: dict[str, Any]
@@ -1737,7 +1967,11 @@ class FlashAdam(FlashOptimizer):
         # Write back
         param.copy_(param_f32.to(param.dtype))
         if errors is not None:
-            errors.copy_(compute_ecc_bits(param_f32, param))
+            errors.copy_(
+                compute_ecc_bits(
+                    param_f32, param, master_bytewidth=hparams["master_bytewidth"]
+                )
+            )
 
         # Update state tensors
         exp_avg.set_data(exp_avg_f32)
@@ -1745,6 +1979,29 @@ class FlashAdam(FlashOptimizer):
 
 
 class FlashAdamW(FlashAdam):
+    """AdamW optimizer with decoupled weight decay.
+
+    Like :class:`FlashAdam` but applies weight decay directly to the
+    parameters (``param *= 1 - wd * lr``) instead of through the gradient.
+
+    Args:
+        params: Iterable of parameters to optimize or dicts defining
+            parameter groups.
+        lr: Learning rate (default: 1e-3).
+        betas: Coefficients for computing running averages of the gradient
+            and its square (default: (0.9, 0.999)).
+        eps: Term added to the denominator for numerical stability
+            (default: 1e-8).
+        weight_decay: Decoupled weight decay coefficient (default: 1e-2).
+        decouple_lr: If True, weight decay is scaled by ``lr / initial_lr``
+            instead of ``lr`` (default: False).
+        quantize: See :class:`FlashOptimizer`.
+        compress_state_dict: See :class:`FlashOptimizer`.
+        master_weight_bits: See :class:`FlashOptimizer`.
+        check_numerics: See :class:`FlashOptimizer`.
+        fused: See :class:`FlashOptimizer`.
+    """
+
     def __init__(
         self,
         params: Iterable[torch.Tensor],
@@ -1755,7 +2012,7 @@ class FlashAdamW(FlashAdam):
         decouple_lr: bool = False,
         quantize: bool = True,
         compress_state_dict: bool = False,
-        master_weight_bits: Literal[24, 32] | None = 24,
+        master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
     ):
@@ -1775,9 +2032,20 @@ class FlashAdamW(FlashAdam):
         self._decouple_lr = decouple_lr
 
 
-def _matches_keyword(name: str, keywords: list[str]) -> bool:
-    segments = name.split(".")
-    return any(keyword in segments for keyword in keywords)
+def _matches_fp32_spec(
+    name: str,
+    module: nn.Module,
+    specs: list[Union[str, nn.Module]],
+) -> bool:
+    from fnmatch import fnmatch
+
+    for spec in specs:
+        if isinstance(spec, nn.Module):
+            if module is spec:
+                return True
+        elif fnmatch(name, spec):
+            return True
+    return False
 
 
 def _fp32_input_cast_hook(
@@ -1792,11 +2060,32 @@ def _fp32_input_cast_hook(
     )
 
 
+def _make_output_cast_hook(dtype: torch.dtype):
+    def _output_cast_hook(
+        module: nn.Module,
+        input: tuple[Any, ...],
+        output: Any,
+    ) -> Any:
+        if isinstance(output, torch.Tensor) and output.is_floating_point():
+            return output.to(dtype)
+        if isinstance(output, tuple):
+            return tuple(
+                o.to(dtype)
+                if isinstance(o, torch.Tensor) and o.is_floating_point()
+                else o
+                for o in output
+            )
+        return output
+
+    return _output_cast_hook
+
+
 def cast_model(
     model: nn.Module,
     dtype: torch.dtype = torch.bfloat16,
     selective: bool = True,
-    full_precision_keywords: list[str] | None = None,
+    full_precision_layers: Optional[list[Union[str, nn.Module]]] = None,
+    full_precision_recast_layers: Optional[list[Union[str, nn.Module]]] = None,
 ) -> None:
     """Cast model parameters and buffers to a different dtype.
 
@@ -1809,15 +2098,41 @@ def cast_model(
         dtype: Target dtype (default: torch.bfloat16).
         selective: If True (default), normalization layers with running statistics
             (BatchNorm, InstanceNorm) are kept in fp32 for stability.
-        full_precision_keywords: Module/parameter names to keep in fp32
-            (e.g., ["lm_head", "classifier"]).
+        full_precision_layers: Layers to keep in fp32 with no output recast.
+            Accepts fnmatch patterns on dotted module names (e.g., `"lm_head"`,
+            `"*.head"`, `"layers.*.attn"`) or direct module references
+            (e.g., `model.lm_head`).  Input hook only — fp32 output is
+            preserved.  Use for terminal layers (lm_head, classifier).
+        full_precision_recast_layers: Layers to keep in fp32 with output
+            recast to *dtype*.  Same matching rules as *full_precision_layers*.
+            Input hook + output hook — output is cast back to *dtype*.
+            Use for middle layers followed by bf16 compute.
+
+    .. NOTE::
+
+        Layer names are matched with `fnmatch.fnmatch` against the full
+        dotted module name, so `"head"` matches a top-level `model.head`
+        but not `model.decoder.head`.  Use `"*.head"` to match nested
+        modules.
     """
-    # Build set of full precision parameter names if keywords provided
-    full_precision_params = set()
-    if full_precision_keywords:
-        for name, _ in model.named_parameters():
-            if _matches_keyword(name, full_precision_keywords):
-                full_precision_params.add(name)
+    all_fp32 = full_precision_layers or []
+    recast_fp32 = full_precision_recast_layers or []
+    all_specs = all_fp32 + recast_fp32
+
+    # Build set of full precision parameter/buffer names by matching modules
+    full_precision_params: set[str] = set()
+    full_precision_buffers: set[str] = set()
+    if all_specs:
+        for mod_name, mod in model.named_modules():
+            if _matches_fp32_spec(mod_name, mod, all_specs):
+                for pname, _ in mod.named_parameters():
+                    full_precision_params.add(
+                        f"{mod_name}.{pname}" if mod_name else pname
+                    )
+                for bname, _ in mod.named_buffers():
+                    full_precision_buffers.add(
+                        f"{mod_name}.{bname}" if mod_name else bname
+                    )
 
     # Get mapping of parameter/buffer to its full name
     param_to_name = {}
@@ -1850,7 +2165,6 @@ def cast_model(
 
         # Convert parameters and buffers to target dtype
         for param in module.parameters(recurse=False):
-            # Skip if this parameter is marked for full precision
             param_name = param_to_name.get(param, "")
             if param_name in full_precision_params:
                 continue
@@ -1860,22 +2174,30 @@ def cast_model(
             param.data = seen[data_id]
 
         for buffer in module.buffers(recurse=False):
-            # Skip if this buffer belongs to a full precision module
             buffer_name = buffer_to_name.get(buffer, "")
-            if _matches_keyword(buffer_name, full_precision_keywords or []):
+            if buffer_name in full_precision_buffers:
+                continue
+            if not buffer.is_floating_point():
                 continue
             data_id = buffer.data.data_ptr()
             if data_id not in seen:
                 seen[data_id] = buffer.data.to(dtype=dtype)
             buffer.data = seen[data_id]
 
-    # Register pre-hook on full precision modules to cast inputs to fp32
-    if full_precision_keywords:
+    # Register hooks on fp32 layers only:
+    # - input pre-hook to cast inputs to fp32 (all fp32 layers)
+    # - output hook to recast output to dtype (recast layers only)
+    if all_fp32 or recast_fp32:
         for name, module in model.named_modules():
-            if _matches_keyword(name, full_precision_keywords):
-                if not getattr(module, "_has_fp32_input_hook", False):
-                    module.register_forward_pre_hook(_fp32_input_cast_hook)
-                    module._has_fp32_input_hook = True
+            is_fp32 = _matches_fp32_spec(name, module, all_fp32)
+            is_recast = _matches_fp32_spec(name, module, recast_fp32)
+            if (is_fp32 or is_recast) and not getattr(
+                module, "_has_fp32_input_hook", False
+            ):
+                module.register_forward_pre_hook(_fp32_input_cast_hook)
+                if is_recast:
+                    module.register_forward_hook(_make_output_cast_hook(dtype))
+                module._has_fp32_input_hook = True
 
 
 def _fused_adam_step(
@@ -2111,7 +2433,7 @@ def _triton_adam_kernel(
                 mask=scales_mask,
             )
         else:
-            # Store momentum and variance directly in full precision
+            # Store states at param precision
             tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
             tl.store(var_ptr + absolute_offsets, var_f32.to(PARAM_DTYPE), mask=mask)
 
@@ -2130,6 +2452,27 @@ def quantize(
     sqrt: bool = False,
     softsign: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a floating-point tensor to grouped INT8.
+
+    Elements are divided into groups of ``group_size``, each group is
+    normalised by its absmax, optionally transformed (sqrt, softsign),
+    and mapped to signed int8 ([-127, 127]) or unsigned uint8 ([0, 255]).
+
+    Args:
+        x_float: Input tensor (any floating dtype, must be on CUDA).
+        out_int8: Optional pre-allocated output tensor for quantized values.
+        out_scales: Optional pre-allocated output tensor for per-group scales.
+        signed: Use signed int8 (default True). False uses unsigned uint8.
+        group_size: Number of elements per quantization group (default 32).
+        sqrt: If True, apply ``sqrt`` before quantization (useful for
+            always-positive values like variance estimates).
+        softsign: If True (default), apply a softsign transform before
+            quantization to improve resolution near zero.
+
+    Returns:
+        Tuple of ``(quantized_values, scales)`` where ``quantized_values``
+        is int8/uint8 and ``scales`` is float16 with one entry per group.
+    """
     N = x_float.numel()
     out_type = tl.int8 if signed else tl.uint8
     out_max = 127.0 if signed else 255.0
@@ -2164,6 +2507,25 @@ def dequantize(
     sqrt: bool = False,
     softsign: bool = True,
 ) -> torch.Tensor:
+    """Dequantize a grouped INT8 tensor back to floating point.
+
+    Inverse of :func:`quantize`. Reconstructs approximate float32 values
+    from quantized integers and per-group scales.
+
+    Args:
+        in_int8: Quantized tensor (int8 or uint8).
+        in_scales: Per-group scale factors (float16), one per group.
+        out_float: Optional pre-allocated output tensor for the result.
+        signed: Whether ``in_int8`` is signed int8 (default True).
+        group_size: Elements per quantization group (default 32).
+        sqrt: If True, square the output to undo a sqrt applied during
+            quantization.
+        softsign: If True (default), apply the inverse softsign transform
+            to undo the softsign applied during quantization.
+
+    Returns:
+        Reconstructed float32 tensor.
+    """
     N = in_int8.numel()
     in_max = 127.0 if signed else 255.0
     if out_float is None:
@@ -2493,8 +2855,18 @@ def reconstruct_fp32_param(
         ...     if "error_bits" in state:
         ...         fp32_param = reconstruct_fp32_param(param, state["error_bits"])
     """
-    if error_bits.dtype.is_floating_point:
-        raise ValueError(f"error_bits must be int8 or int16, got {error_bits.dtype}. ")
+    if param.dtype == torch.float32:
+        raise ValueError(
+            f"param is already fp32; ECC reconstruction is only meaningful for "
+            f"narrow dtypes (bf16, fp16). Got {param.dtype}."
+        )
+    if param.dtype not in _NUM_MANTISSA_BITS:
+        raise ValueError(
+            f"Unsupported param dtype {param.dtype}; expected one of "
+            f"{list(_NUM_MANTISSA_BITS)}."
+        )
+    if error_bits.dtype not in (torch.int8, torch.int16):
+        raise ValueError(f"error_bits must be int8 or int16, got {error_bits.dtype}.")
 
     # Apply ECC reconstruction for int8/int16 error bits
     BLOCK_SIZE = 1024
@@ -2523,6 +2895,7 @@ def reconstruct_fp32_param(
 def compute_ecc_bits(
     fp32_param: torch.Tensor,
     narrow_param: torch.Tensor,
+    master_bytewidth: int = 4,
 ) -> torch.Tensor:
     """Compute ECC bits from fp32 weights and narrow dtype weights.
 
@@ -2533,6 +2906,7 @@ def compute_ecc_bits(
     Args:
         fp32_param: Parameter tensor in fp32 dtype
         narrow_param: Parameter tensor in narrow dtype (bf16, fp16, etc.)
+        master_bytewidth: Target master weight width in bytes (e.g. 3 for 24-bit, 4 for 32-bit).
 
     Returns:
         ECC tensor (int8 or int16) containing error correction bits
@@ -2545,13 +2919,19 @@ def compute_ecc_bits(
         >>> for name, param in model.named_parameters():
         ...     fp32_val = fp32_weights[name]
         ...     param.copy_(fp32_val.to(param.dtype))
-        ...     ecc = compute_ecc_bits(fp32_val.to(param.device), param)
+        ...     ecc = compute_ecc_bits(fp32_val.to(param.device), param, master_bytewidth=3)
         ...     optimizer.state[param]["error_bits"] = ecc
     """
+    if fp32_param.dtype != torch.float32:
+        raise ValueError(f"fp32_param must be float32, got {fp32_param.dtype}.")
+    if narrow_param.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(
+            f"narrow_param must be bf16 or fp16, got {narrow_param.dtype}."
+        )
+
     # Determine error dtype from byte width difference
-    fp32_bytes = 4
     narrow_bytes = narrow_param.element_size()
-    num_err_bytes = fp32_bytes - narrow_bytes
+    num_err_bytes = master_bytewidth - narrow_bytes
 
     if num_err_bytes == 1:
         error_dtype = torch.int8
@@ -2563,7 +2943,7 @@ def compute_ecc_bits(
         signed_error_t = tl.int16
     else:
         raise ValueError(
-            f"Unsupported dtype combination: fp32 (4 bytes) to {narrow_param.dtype} ({narrow_bytes} bytes). "
+            f"Unsupported dtype combination: master_bytewidth={master_bytewidth} to {narrow_param.dtype} ({narrow_bytes} bytes). "
             f"Error byte width {num_err_bytes} must be 1 or 2."
         )
 
@@ -2640,7 +3020,7 @@ def _register_plain_hooks(
     model: torch.nn.Module,
     optimizer: FlashOptimizer,
     hooks: list,
-    pre_step: Callable[[torch.Tensor, dict[str, Any]], bool] | None,
+    pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]],
     param_to_group: dict[int, dict[str, Any]],
 ) -> None:
     # Shared / tied parameters are safe here for two reasons:
@@ -2675,8 +3055,8 @@ def enable_gradient_release(
     model: torch.nn.Module,
     optimizer: FlashOptimizer,
     *,
-    grad_scaler: "torch.amp.GradScaler | None" = None,
-    pre_step: Callable[[torch.Tensor, dict[str, Any]], bool] | None = None,
+    grad_scaler: Optional["torch.amp.GradScaler"] = None,
+    pre_step: Optional[Callable[[torch.Tensor, dict[str, Any]], bool]] = None,
 ) -> GradientReleaseHandle:
     """Attach hooks so the optimizer steps each parameter as soon as its
     gradient is ready and frees the gradient immediately.

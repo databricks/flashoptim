@@ -8,7 +8,7 @@ By [Jose Javier Gonzalez Ortiz](https://x.com/jjgort), [Abhay Gupta](https://x.c
 [![PyPI](https://img.shields.io/pypi/v/flashoptim)](https://pypi.org/project/flashoptim/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/pytorch-%3E%3D2.7-ee4c2c)](https://pytorch.org/)
+[![PyTorch](https://img.shields.io/badge/pytorch-%3E%3D2.6-ee4c2c)](https://pytorch.org/)
 [![arXiv](https://img.shields.io/badge/arXiv-2602.23349-b31b1b.svg)](https://arxiv.org/abs/2602.23349)
 
 ## TL;DR
@@ -111,7 +111,7 @@ The exact behavior depends on the dtype of the parameters passed to the optimize
     - `master_weight_bits=None`: no master weight correction; optimizer states are still quantized, but parameters stay at their native precision
 - **fp32 parameters**: Optimizer states (moments) are quantized to 8-bit to reduce memory. Parameters are already full precision, so `master_weight_bits` is not applicable.
 
-To cast a model's parameters and buffers to bf16, use the `cast_model` helper. `cast_model` uses keyword matching against module names to determine which layers to keep in full precision, by default, normalization layers are kept in fp32 for training stability. It also registers forward pre-hooks on fp32 modules to automatically upcast their inputs during the forward pass:
+To cast a model's parameters and buffers to bf16, use the `cast_model` helper. By default, normalization layers with running statistics are kept in fp32 for training stability. Forward pre-hooks upcast inputs to fp32 modules automatically:
 
 ```python
 from flashoptim import cast_model
@@ -119,12 +119,18 @@ from flashoptim import cast_model
 # Cast all parameters to bf16 (normalization layers kept in fp32 by default)
 cast_model(model, dtype=torch.bfloat16)
 
-# Keep specific layers (e.g., the output head) in fp32
-cast_model(model, dtype=torch.bfloat16, full_precision_keywords=["lm_head", "head"])
+# Terminal layers (e.g., lm_head) — kept fp32, output stays fp32
+cast_model(model, dtype=torch.bfloat16, full_precision_layers=["lm_head", "*.head"])
+
+# Middle layers — kept fp32 but output recast to bf16
+cast_model(model, dtype=torch.bfloat16, full_precision_recast_layers=["target"])
+
+# Module references work too
+cast_model(model, full_precision_layers=[model.lm_head])
 ```
 
 > [!NOTE]
-> Keywords are matched against dot-separated name segments, so `"head"` matches `model.head.weight` but not `model.header.weight`.
+> Layer names are matched with `fnmatch` against the full dotted module name, so `"head"` matches a top-level `model.head` but **not** `model.decoder.head`. Use `"*.head"` for nested modules.
 
 ### Weight Decay
 
@@ -172,7 +178,7 @@ import torchvision
 from flashoptim import FlashAdamW, cast_model
 
 model = torchvision.models.resnet18().cuda()
-cast_model(model, dtype=torch.bfloat16, full_precision_keywords=["fc"])
+cast_model(model, dtype=torch.bfloat16, full_precision_layers=["fc"])
 optimizer = FlashAdamW(model.parameters(), lr=1e-3, master_weight_bits=24)
 
 # ... training ...
@@ -256,6 +262,30 @@ Gradient release is compatible with single-GPU training and FSDP2 (`fully_shard`
 When training in reduced precision, a learning rate that is too small relative to the parameter magnitudes can produce updates that round to zero, silently stalling training.
 Setting `check_numerics=True` detects this: at each step FlashOptim verifies that `lr` is large enough to actually change the largest values in every tensor (given the parameter dtype and `master_weight_bits`).
 This is useful as a sanity check during early training to catch silent stalls caused by updates that round to zero.
+
+### Distributed Checkpointing (DCP) with FSDP2
+
+FlashOptim supports saving and loading optimizer state via `torch.distributed.checkpoint` helpers:
+
+```python
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
+)
+
+# Save
+osd = get_optimizer_state_dict(model, optimizer)
+dcp.save({"optimizer": osd}, checkpoint_id=ckpt_dir)
+
+# Load
+osd = get_optimizer_state_dict(model, optimizer)  # template
+dcp.load({"optimizer": osd}, checkpoint_id=ckpt_dir)
+set_optimizer_state_dict(model, optimizer, osd)
+```
+
+> [!WARNING]
+> The `flatten_optimizer_state_dict=True)` is **not compatible** with FlashOptim compressed checkpoints (i.e. `compress_state_dict=True`), because of key issues during unflattenning.
 
 ## 5. Compatibility
 
