@@ -218,6 +218,21 @@ def test_state_dict_save_load(
 _CKPT_SEEDS = [0, 1]
 
 
+def test_state_dict_before_first_step_matches_torch_empty_state():
+    """Accelerate inspects optimizer state before the first step during prepare()."""
+    params = [
+        torch.nn.Parameter(torch.randn(8, device="cuda", dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.randn(4, device="cuda", dtype=torch.bfloat16)),
+    ]
+
+    opt = ADAMW_CONFIG.factory(params, lr=1e-3)
+    state_dict = opt.state_dict()
+
+    assert state_dict["state"] == {}
+    assert len(state_dict["param_groups"]) == 1
+    assert state_dict["param_groups"][0]["params"] == [0, 1]
+
+
 @pytest.mark.parametrize("seed", _CKPT_SEEDS, ids=seed_id)
 @pytest.mark.parametrize("ckpt_config", _CKPT_CONFIGS, ids=ckpt_id)
 @pytest.mark.parametrize(

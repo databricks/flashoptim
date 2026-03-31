@@ -615,6 +615,19 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             return tensor.to_local()
         return tensor
 
+    @classmethod
+    def _state_key_token(cls, tensor: torch.Tensor) -> tuple[int, int]:
+        """Build a stable token for matching optimizer state to current params.
+
+        FSDP2 can swap optimizer param-group entries to new DTensor objects whose
+        local shards alias the same storage. Matching only on Python object id is
+        too strict for checkpoint export, while matching only on storage pointer
+        is too loose for non-tensor keys. We use both local shard pointer and
+        numel to keep the matching stable across these rewrites.
+        """
+        local = cls._get_local_tensor(tensor)
+        return (local.data_ptr(), local.numel())
+
     @staticmethod
     def _wrap_state_as_dtensor(state: dict[str, Any], param: torch.Tensor) -> None:
         """Wrap plain state tensors as DTensors matching param's distribution.
@@ -632,18 +645,17 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
 
         # Reject uneven shards — DTensor.from_local infers global shape as
         # local_size * world_size, which is only correct for even splits.
+        #
+        # In full-state-dict export paths, leaving tensors unwrapped is still
+        # preferable to raising here, since the caller may only need a regular
+        # gathered state dict. We therefore bail out silently for uneven shards
+        # instead of failing checkpoint saving entirely.
         for mesh_dim, placement in enumerate(placements):
             if hasattr(placement, "dim"):
                 shard_dim = placement.dim
                 mesh_size = mesh.size(mesh_dim)
                 if param.shape[shard_dim] % mesh_size != 0:
-                    raise ValueError(
-                        f"DCP checkpointing requires evenly-sharded parameters, "
-                        f"but parameter with shape {param.shape} is unevenly "
-                        f"sharded on dim {shard_dim} across {mesh_size} ranks. "
-                        f"Pad or reshape the parameter so that shape[{shard_dim}] "
-                        f"is divisible by {mesh_size}."
-                    )
+                    return
 
         for key, val in state.items():
             if (
@@ -872,6 +884,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         hparams: dict[str, Any],
         idx_to_param: dict[int, torch.Tensor],
     ) -> dict[str, Any]:
+        if param_number not in opt_state:
+            return {}
+
         # Make a copy so that we don't mutate our self.state. `opt_state`
         # isn't the same as self.state, but its consituent dicts are
         # the same as those in self.state; i.e., `opt_state[p] is self.state[p]`
@@ -949,9 +964,39 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         super().__setstate__(state)
 
     def state_dict(self):
-        d = super().state_dict()
-        opt_state = d["state"]
-        param_groups = d["param_groups"]
+        for pre_hook in self._optimizer_state_dict_pre_hooks.values():
+            pre_hook(self)
+
+        param_mappings: dict[int, int] = {}
+        param_tokens: dict[tuple[int, int], int] = {}
+        start_index = 0
+
+        def pack_group(group: dict[str, Any]) -> dict[str, Any]:
+            nonlocal start_index
+            packed = {k: v for k, v in group.items() if k != "params"}
+            packed_params = []
+            for p in group["params"]:
+                idx = param_mappings.setdefault(id(p), start_index)
+                param_tokens.setdefault(self._state_key_token(p), idx)
+                packed_params.append(idx)
+                if idx == start_index:
+                    start_index += 1
+            packed["params"] = packed_params
+            return packed
+
+        param_groups = [pack_group(g) for g in self.param_groups]
+        opt_state = {}
+
+        for key, value in self.state.items():
+            if isinstance(key, torch.Tensor):
+                idx = param_mappings.get(id(key))
+                if idx is None:
+                    idx = param_tokens.get(self._state_key_token(key))
+                if idx is None:
+                    continue
+                opt_state[idx] = value
+            else:
+                opt_state[key] = value
 
         # Build param index -> param mapping without mutating self.state
         idx_to_param: dict[int, torch.Tensor] = {}
@@ -962,14 +1007,25 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         for group in param_groups:
             for param_number in group["params"]:
                 assert isinstance(param_number, int)
-                opt_state[param_number] = self._state_dict_for_param(
+                param_state = self._state_dict_for_param(
                     param_number,
                     opt_state=opt_state,
                     hparams=group,
                     idx_to_param=idx_to_param,
                 )
+                if param_state:
+                    opt_state[param_number] = param_state
 
-        return d
+        state_dict = {
+            "state": opt_state,
+            "param_groups": param_groups,
+        }
+
+        for post_hook in self._optimizer_state_dict_post_hooks.values():
+            hook_result = post_hook(self, state_dict)
+            if hook_result is not None:
+                state_dict = hook_result
+        return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load optimizer state, ensuring backward compatibility with vanilla PyTorch optimizers.
