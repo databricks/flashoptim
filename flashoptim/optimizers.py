@@ -1055,6 +1055,14 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # FSDP2 support: state tensors must be created from local tensors, not DTensors.
         # This ensures each rank has state for its local parameter shard.
         p_local = self._get_local_tensor(p)
+        if not p_local.is_cuda:
+            raise ValueError(
+                "FlashOptim requires parameter shards to be on CUDA at optimizer "
+                "step time. Detected a CPU shard while initializing optimizer "
+                "state, which usually means FSDP2 or ZeRO CPU offload is enabled. "
+                "Disable CPU parameter offload to use FlashOptim, for example "
+                "set fsdp_offload_params: false."
+            )
 
         quantize = hparams.get("quantize", self._quantize)
         for key_quant, spec in self._quantized_state_spec().items():

@@ -233,6 +233,16 @@ def test_state_dict_before_first_step_matches_torch_empty_state():
     assert state_dict["param_groups"][0]["params"] == [0, 1]
 
 
+def test_cpu_offloaded_param_raises_helpful_error():
+    """CPU-offloaded shards should fail early with a targeted message."""
+    param = torch.nn.Parameter(torch.randn(16, device="cpu", dtype=torch.bfloat16))
+    param.grad = torch.randn_like(param)
+
+    opt = ADAMW_CONFIG.factory([param], lr=1e-3)
+    with pytest.raises(ValueError, match="requires parameter shards to be on CUDA"):
+        opt.step()
+
+
 @pytest.mark.parametrize("seed", _CKPT_SEEDS, ids=seed_id)
 @pytest.mark.parametrize("ckpt_config", _CKPT_CONFIGS, ids=ckpt_id)
 @pytest.mark.parametrize(
