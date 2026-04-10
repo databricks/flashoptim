@@ -288,13 +288,6 @@ __global__ void flash_adam_kernel(
                 var_sqrt_abs = fmaxf(var_sqrt_abs, var_f[i]);
             }
 
-            float warp_mom = mom_abs, warp_var = var_sqrt_abs;
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                warp_mom = fmaxf(warp_mom, __shfl_xor_sync(reduce_mask, warp_mom, off));
-                warp_var = fmaxf(warp_var, __shfl_xor_sync(reduce_mask, warp_var, off));
-            }
-
             float group_mom = mom_abs, group_var = var_sqrt_abs;
 #pragma unroll
             for (int off = THREADS_PER_GROUP >> 1; off > 0; off >>= 1) {
