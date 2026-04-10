@@ -34,6 +34,23 @@ import triton.language as tl
 import triton.language.extra.libdevice as libdevice
 
 
+_cuda_adam_ext = None
+_cuda_adam_load_attempted = False
+
+
+def _try_load_cuda_adam_ext():
+    """Lazily load the CUDA Adam extension on first use."""
+    global _cuda_adam_ext, _cuda_adam_load_attempted
+    if _cuda_adam_load_attempted:
+        return
+    _cuda_adam_load_attempted = True
+    try:
+        import flashoptim._cuda_adam as _ext  # noqa: F401
+        _cuda_adam_ext = _ext
+    except ImportError:
+        pass  # silently fall back to Triton
+
+
 class NumericsError(RuntimeError):
     """The optimizer detected that the learning rate is too small to
     meaningfully update weights at their current magnitude and dtype."""
@@ -2221,6 +2238,29 @@ def _fused_adam_step(
     N = param.numel()
     if N == 0:
         return
+
+    _try_load_cuda_adam_ext()
+    if _cuda_adam_ext is not None:
+        _cuda_adam_ext.adam_step(
+            mom,
+            mom_scales_f16 if quantize_optim_states else mom,
+            var,
+            var_scales_f16 if quantize_optim_states else var,
+            param,
+            grad,
+            errors,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            step,
+            quantize_optim_states,
+            decoupled,
+            group_size,
+        )
+        return
+
     use_ecc, signed_max_val, errors, signed_error_t = _ecc_kernel_params(errors, param)
 
     grid = functools.partial(_make_grid, N)
