@@ -145,7 +145,23 @@ def main():
     import flashoptim.optimizers as opt_mod
     opt_mod._try_load_cuda_adam_ext()
 
+    # Pre-warm Triton JIT for all (dtype, quantize, decoupled) combos
+    # Use N=65536 to ensure the exact same Triton kernel (tiled for that size) is compiled.
     device = "cuda"
+    print("Pre-warming Triton JIT...", end=" ", flush=True)
+    seen = set()
+    for cfg in CONFIGS:
+        key = (cfg.dtype, cfg.quantize, cfg.decoupled)
+        if key in seen:
+            continue
+        seen.add(key)
+        dtype = _DTYPE_MAP[cfg.dtype]
+        p, g, m, ms, v, vs = _make_state(65536, device, cfg.quantize, dtype)
+        for _ in range(3):
+            _run_triton(p.clone(), g, m.clone(), ms.clone(), v.clone(), vs.clone(),
+                        cfg.quantize, cfg.decoupled, 1)
+        torch.cuda.synchronize()
+    print("done")
     gpu_name = torch.cuda.get_device_name(0)
     p = torch.cuda.get_device_properties(0)
     print(f"\n{'='*72}")

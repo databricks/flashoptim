@@ -263,33 +263,31 @@ def test_cuda_vs_triton_boundary_sizes(N, quantize):
 @requires_cuda_ext
 @pytest.mark.parametrize("quantize", [True, False])
 @pytest.mark.parametrize("decoupled", [True, False])
-def test_cuda_multi_step_vs_fp32(quantize, decoupled):
-    """Over 20 steps, CUDA param stays NaN/Inf-free and close to fp32 reference."""
+def test_cuda_multi_step_vs_triton(quantize, decoupled):
+    """Over 20 steps, CUDA and Triton produce identical params (within ±1 quant LSB per step)."""
     N, device, dtype = 4096, "cuda", torch.bfloat16
     lr, beta1, beta2, eps, wd = 1e-3, 0.9, 0.999, 1e-8, 0.01
 
-    param_c, grad_c, mom_c, ms_c, var_c, vs_c = _make_state(N, device, quantize, dtype)
-
-    # fp32 reference (no quantization of states)
-    param_fp32 = param_c.float().clone()
-    mom_fp32   = torch.zeros_like(param_fp32)
-    var_fp32   = torch.zeros_like(param_fp32)
+    param_t, grad_t, mom_t, ms_t, var_t, vs_t = _make_state(N, device, quantize, dtype)
+    param_c = param_t.clone(); mom_c = mom_t.clone(); ms_c = ms_t.clone()
+    var_c   = var_t.clone();   vs_c  = vs_t.clone()
 
     for step in range(1, 21):
-        grad_new = torch.randn_like(grad_c) * 0.01
+        grad_new = torch.randn(N, device=device, dtype=dtype,
+                               generator=torch.Generator(device).manual_seed(step)) * 0.01
+        _run_triton(param_t, grad_new, mom_t, ms_t, var_t, vs_t,
+                    lr, beta1, beta2, eps, wd, step, quantize, decoupled)
         _run_cuda(param_c, grad_new, mom_c, ms_c, var_c, vs_c,
                   lr, beta1, beta2, eps, wd, step, quantize, decoupled)
-        _fp32_adam_step(param_fp32, grad_new.float(), mom_fp32, var_fp32,
-                        lr, beta1, beta2, eps, wd, step, decoupled)
 
-    assert not param_c.isnan().any(), "NaN in param after 20 steps"
-    assert not param_c.isinf().any(), "Inf in param after 20 steps"
+    assert not param_c.isnan().any(), "NaN in CUDA param after 20 steps"
+    assert not param_c.isinf().any(), "Inf in CUDA param after 20 steps"
 
-    # Allow more drift with quantization; without quantization should be tight
-    atol = 0.05 if quantize else 1e-2
+    # CUDA and Triton should agree closely; quantization adds ~1 LSB per step
+    atol = 1e-2 if quantize else 1e-4
     torch.testing.assert_close(
-        param_c.float(), param_fp32, atol=atol, rtol=0.1,
-        msg=f"20-step drift vs fp32: quantize={quantize}, decoupled={decoupled}",
+        param_c.float(), param_t.float(), atol=atol, rtol=1e-2,
+        msg=f"20-step CUDA vs Triton: quantize={quantize}, decoupled={decoupled}",
     )
 
 
