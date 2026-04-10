@@ -269,7 +269,7 @@ __global__ void flash_adam_kernel(
         }
 
         if constexpr (kQuantize) {
-            constexpr int THREADS_PER_GROUP = GROUP_SIZE / VEC;
+            constexpr int THREADS_PER_GROUP = GROUP_SIZE / VEC;  // 8
 
             const int group_lane         = lane % THREADS_PER_GROUP;
             const int group_start_lane   = (lane / THREADS_PER_GROUP) * THREADS_PER_GROUP;
@@ -280,25 +280,37 @@ __global__ void flash_adam_kernel(
 
             constexpr unsigned int reduce_mask = 0xffffffffu;
 
-            // Compute sqrt(var) in-place: reuse var_f to avoid extra registers
+            // Compute sqrt(var) in-place, accumulate per-thread absmax
             float mom_abs = 0.f, var_sqrt_abs = 0.f;
             for (int i = 0; i < VEC; i++) {
                 mom_abs      = fmaxf(mom_abs,      fabsf(mom_f[i]));
-                var_f[i]     = sqrtf(fmaxf(var_f[i], 0.f));  // var_f now holds sqrt(var)
+                var_f[i]     = sqrtf(fmaxf(var_f[i], 0.f));
                 var_sqrt_abs = fmaxf(var_sqrt_abs, var_f[i]);
             }
+
+            float warp_mom = mom_abs, warp_var = var_sqrt_abs;
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                warp_mom = fmaxf(warp_mom, __shfl_xor_sync(reduce_mask, warp_mom, off));
+                warp_var = fmaxf(warp_var, __shfl_xor_sync(reduce_mask, warp_var, off));
+            }
+
+            float group_mom = mom_abs, group_var = var_sqrt_abs;
 #pragma unroll
             for (int off = THREADS_PER_GROUP >> 1; off > 0; off >>= 1) {
-                mom_abs      = fmaxf(mom_abs,      __shfl_xor_sync(reduce_mask, mom_abs,      off));
-                var_sqrt_abs = fmaxf(var_sqrt_abs, __shfl_xor_sync(reduce_mask, var_sqrt_abs, off));
+                group_mom = fmaxf(group_mom, __shfl_xor_sync(reduce_mask, group_mom, off));
+                group_var = fmaxf(group_var, __shfl_xor_sync(reduce_mask, group_var, off));
             }
-            mom_abs      = fmaxf(mom_abs,      1e-12f);
-            var_sqrt_abs = fmaxf(var_sqrt_abs, 1e-12f);
+            // Now group_start_lane holds the correct group max; broadcast to all in group.
+            mom_abs      = fmaxf(__shfl_sync(reduce_mask, group_mom, group_start_lane), 1e-12f);
+            var_sqrt_abs = fmaxf(__shfl_sync(reduce_mask, group_var, group_start_lane), 1e-12f);
 
-            // Quantise in-place into mom_f/var_f, then store
+            // Quantise in-place: use rcp multiply instead of divide for speed
+            const float inv_mom_abs      = 1.f / mom_abs;
+            const float inv_var_sqrt_abs = 1.f / var_sqrt_abs;
             for (int i = 0; i < VEC; i++) {
-                mom_f[i] = softsign(mom_f[i] / mom_abs) * 127.f;
-                var_f[i] = (var_f[i] / var_sqrt_abs) * 255.f;
+                mom_f[i] = softsign(mom_f[i] * inv_mom_abs) * 127.f;
+                var_f[i] = (var_f[i] * inv_var_sqrt_abs) * 255.f;
             }
 
             if (in_bounds) {
