@@ -52,7 +52,7 @@ DTYPE_ECC_QUANT_CONFIGS = [
 
 # Reduced configs for distributed tests (DDP/FSDP2).
 # Distributed correctness (gradient all-reduce, parameter sync) is orthogonal to
-# dtype/ecc/quant — those dimensions are already fully covered by single-GPU tests.
+# dtype/ecc/quant - those dimensions are already fully covered by single-GPU tests.
 DIST_DTYPE_ECC_QUANT_CONFIGS = [
     (torch.float32, None, False),  # fp32, no ECC, unquantized
     (torch.float32, None, True),  # fp32, no ECC, quantized
@@ -140,7 +140,7 @@ ADAM_L2_CONFIG = OptimizerTestConfig(
     state_var_names=["exp_avg", "exp_avg_sq"],
 )
 
-# decouple_lr=True variants — fully LR-decoupled weight decay
+# decouple_lr=True variants - fully LR-decoupled weight decay
 LION_DECOUPLE_LR_CONFIG = OptimizerTestConfig(
     name="FlashLion_DecoupleLR",
     factory=functools.partial(FlashLion, betas=(0.5, 0.75), decouple_lr=True),
@@ -252,7 +252,7 @@ def nmse(
     Args:
         vals_true: Ground truth tensor
         vals_hat: Approximation tensor
-        norm_how: Normalization method — "l2_sq" (default) or "var"
+        norm_how: Normalization method - "l2_sq" (default) or "var"
 
     Returns:
         NMSE as a float scalar

@@ -164,7 +164,7 @@ class _MaybeQuantizedTensor:
                 _MaybeQuantizedTensor._quantized_vals_key(name): self.quantized,
                 _MaybeQuantizedTensor._quantized_scales_key(name): self.scales,
             }
-        return {name: self.materialize().to(dtype=torch.bfloat16)}
+        return {name: self.materialize()}
 
     @classmethod
     def from_state_dict(
@@ -385,13 +385,17 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         weight decay: Weights are multiplied by 1 - `weight_decay` after
             each optimizer step. Note that we use decoupled weight decay,
             meaning that this decay does not contribute to the momentum.
-        compress_state_dict: if True, this optimizer's `state_dict` will
-            include quantized optimizer states. Otherwise, the optimizer
-            states are converted to bfloat16 Tensors matching the shapes of
-            their corresponding parameters. The former uses ~8.5 bits per
-            parameter while the latter uses 16 bits per parameter. However,
-            the former is less thoroughly tested and will not work with
-            FSDP or other weight sharding approaches.
+        compress_state_dict: if True (default), this optimizer's
+            `state_dict` will include quantized optimizer states when
+            ``quantize=True``. Otherwise, the optimizer states are
+            dequantized to fp32 Tensors matching the shapes of their
+            corresponding parameters. The former uses ~8.5 bits per
+            parameter while the latter uses 32 bits per parameter. The
+            compressed format is not compatible with FSDP1 or other
+            weight sharding approaches that assume optimizer states
+            share the parameter shape. FSDP2 (``fully_shard``) is
+            fully supported via distributed checkpointing (DCP).
+            When ``quantize=False``, this flag has no effect.
         quantize: If True (default), optimizer states (momentum,
             variance) are quantized to INT8, reducing memory from 32 to
             ~8.5 bits per parameter. Set to False to keep states in FP32
@@ -447,10 +451,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
     Raises:
         ValueError - If the hyperparameters fail sanity checks, such as
             having a learning rate greater than zero.
-        NotImplementedError - If any of `quantize`, `compress_state_dict`,
-            `master_weight_bits`, or `fused` are enabled and either a) there
-            is no CUDA device, or b) step() is executed on a non-CUDA
-            parameter.
+        NotImplementedError - If any of `quantize`, `master_weight_bits`,
+            or `fused` are enabled and either a) there is no CUDA device,
+            or b) step() is executed on a non-CUDA parameter.
         NumericsError - If check_numerics is True and estimates that the
             learning rate is too small to alter the weights.
     """
@@ -460,7 +463,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         params: Iterable[torch.Tensor],
         lr: float = 1e-3,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -468,8 +471,6 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # param groups
         defaults: Optional[dict[str, Any]] = None,
     ):
-        if compress_state_dict and not quantize:
-            raise ValueError("compress_state_dict=True requires quantize=True")
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if master_weight_bits not in _VALID_MASTER_WEIGHT_BITS:
@@ -485,8 +486,6 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             needs_cuda = " requires a CUDA device."
             if quantize:
                 raise NotImplementedError("Quantization" + needs_cuda)
-            if compress_state_dict:
-                raise NotImplementedError("Quantized state dict" + needs_cuda)
             if master_weight_bits is not None:
                 raise NotImplementedError("Using error correction bits" + needs_cuda)
             if fused:
@@ -507,7 +506,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 "quantize": quantize,
             }
         )
-        # Keyed by id(param) — stores lightweight metadata (e.g. maxabs)
+        # Keyed by id(param) - stores lightweight metadata (e.g. maxabs)
         # that should NOT be serialized in state_dict.
         self._transient_state: dict[int, dict[str, Any]] = {}
 
@@ -576,6 +575,14 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
     @abc.abstractmethod
     def _quantized_state_spec(self) -> dict[str, QuantizedTensorSpec]: ...
 
+    @functools.cached_property
+    def quantized_state_spec(self) -> dict[str, QuantizedTensorSpec]:
+        return self._quantized_state_spec()
+
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        super().add_param_group(param_group)
+        self.__dict__.pop("quantized_state_spec", None)
+
     @staticmethod
     def _get_tensor_for_stats(tensor: torch.Tensor) -> torch.Tensor:
         """Get tensor suitable for stats computation, handling FSDP2 DTensors.
@@ -630,7 +637,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         mesh = param.device_mesh
         placements = param.placements
 
-        # Reject uneven shards — DTensor.from_local infers global shape as
+        # Reject uneven shards - DTensor.from_local infers global shape as
         # local_size * world_size, which is only correct for even splits.
         for mesh_dim, placement in enumerate(placements):
             if hasattr(placement, "dim"):
@@ -699,6 +706,9 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         if group is None:
             group = self._find_group(p)
 
+        if not p.requires_grad or p.grad is None:
+            return
+
         self._ensure_state_initialized(p, hparams=group)
         param_state = self.state[p]
 
@@ -706,11 +716,6 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # world size; but these params still need their states initialized for
         # distributed checkpointing logic, so only exit the function here
         if p.numel() < 1:
-            return
-        # similarly, distributed checkpoint logic needs state initialized for
-        # every tensor in every group's params, even if it doesn't actually
-        # need a gradient (as of torch 2.3). So don't early exit until here.
-        if not p.requires_grad or p.grad is None:
             return
 
         # with the current learning rate and cached param statistics, should
@@ -770,7 +775,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
     def step(self, closure: Optional[Callable] = None) -> Optional[torch.Tensor]:
         if self._gradient_release:
             warnings.warn(
-                "optimizer.step() is a no-op while enable_gradient_release() is active — "
+                "optimizer.step() is a no-op while enable_gradient_release() is active - "
                 "parameters are stepped by gradient hooks.",
                 stacklevel=2,
             )
@@ -787,7 +792,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
     def zero_grad(self, set_to_none: bool = True) -> None:
         if self._gradient_release:
             warnings.warn(
-                "optimizer.zero_grad() is a no-op while enable_gradient_release() is active — "
+                "optimizer.zero_grad() is a no-op while enable_gradient_release() is active - "
                 "gradients are freed by gradient hooks.",
                 stacklevel=2,
             )
@@ -804,7 +809,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         new_state = {}
 
         # State dict change 1 of 3: Copy non-quantized keys (like step)
-        quantized_keys = self._quantized_state_spec()
+        quantized_keys = self.quantized_state_spec
         for key, value in param_state.items():
             if not any(key == qk or key.startswith(f"{qk}::") for qk in quantized_keys):
                 new_state[key] = value
@@ -817,6 +822,16 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 # "exp_avg::quantized" and "exp_avg::scales", depending on
                 # whether we saved it as quantized or not. The former case
                 # also gives us interop with non-quantized optimizers.
+                # Undo bf16 view-cast of scales if present (see
+                # _state_dict_for_param). For bf16 params, scales are
+                # stored as a bf16 view of fp16 bytes to survive
+                # PyTorch's dtype cast losslessly.
+                scales_key = _MaybeQuantizedTensor._quantized_scales_key(key_quant)
+                if scales_key in param_state:
+                    s = param_state[scales_key]
+                    if s.dtype == torch.bfloat16:
+                        param_state[scales_key] = s.view(dtype=torch.float16)
+
                 qtensor = _MaybeQuantizedTensor.from_state_dict(
                     param_state,
                     name=key_quant,
@@ -878,7 +893,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         param_state = dict(opt_state[param_number].items())
 
         # State dict change 1 of 2: undo quantization if needed.
-        for key_quant in self._quantized_state_spec().keys():
+        for key_quant in self.quantized_state_spec.keys():
             if key_quant in param_state:  # true if we've taken any steps
                 # If the user hasn't opted into storing compressed state dicts
                 # we have to make sure our states are regular torch.Tensors.
@@ -888,11 +903,19 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 # for any param.
                 qtensor = param_state.pop(key_quant)
                 assert isinstance(qtensor, _MaybeQuantizedTensor)
-                param_state.update(
-                    qtensor.state_dict(
-                        name=key_quant, allow_quantized=self._compress_state_dict
-                    )
+                sd = qtensor.state_dict(
+                    name=key_quant, allow_quantized=self._compress_state_dict
                 )
+                # View-cast fp16 scales → bf16 for bf16 params so PyTorch's
+                # dtype cast (bf16 → bf16) is a no-op, preserving fp16 bits.
+                # _load_state_for_param undoes this via .view(dtype=fp16).
+                scales_key = _MaybeQuantizedTensor._quantized_scales_key(key_quant)
+                if (
+                    scales_key in sd
+                    and idx_to_param[param_number].dtype == torch.bfloat16
+                ):
+                    sd[scales_key] = sd[scales_key].view(dtype=torch.bfloat16)
+                param_state.update(sd)
 
         # State dict change 2 of 2: have error-correction state appease FSDP.
         if "error_bits" in param_state:
@@ -934,6 +957,8 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         for group in param_groups:
             for param in group["params"]:
                 assert isinstance(param, torch.Tensor)
+                if param not in opt_state or not opt_state[param]:
+                    continue  # frozen param, no optimizer state
                 # Unwrap DTensors to local tensors (Triton kernel requirement)
                 param_state = opt_state[param]
                 for key, val in param_state.items():
@@ -962,6 +987,8 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         for group in param_groups:
             for param_number in group["params"]:
                 assert isinstance(param_number, int)
+                if param_number not in opt_state:
+                    continue  # frozen param, no optimizer state
                 opt_state[param_number] = self._state_dict_for_param(
                     param_number,
                     opt_state=opt_state,
@@ -979,11 +1006,68 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         'initial_lr' is present in all param_groups after loading, defaulting to the
         current 'lr' value if missing.
         """
+        if self._quantize:
+            self._pre_quantize_state_dict(state_dict)
         super().load_state_dict(state_dict)
         # Ensure initial_lr is present for all param_groups
         for group in self.param_groups:
             if "initial_lr" not in group:
                 group["initial_lr"] = group["lr"]
+
+    def _pre_quantize_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Convert uncompressed float optimizer states to quantized format.
+
+        PyTorch's Optimizer.load_state_dict casts all floating-point state
+        tensors to param dtype (e.g., bf16) via ``value.to(dtype=param.dtype)``.
+        For raw fp32 optimizer states this is lossy (23-bit → 7-bit mantissa).
+
+        By pre-quantizing to int8 + fp16 scales, the bf16 cast becomes
+        lossless for the quantized values (all int8 values are exactly
+        representable in bf16). For bf16 params, scales are view-cast
+        fp16 → bf16 so PyTorch's cast is a no-op preserving the fp16 bits.
+        """
+        spec = self.quantized_state_spec
+        if not spec:
+            return
+
+        # All params share one device; check if any are bf16 for scales view-cast.
+        # NOTE: this assumes all params in the optimizer share the same dtype.
+        # Mixed bf16/fp16 params in a single optimizer would need per-param
+        # dtype checks (via an idx_to_param map, as in state_dict()). In
+        # practice users should use separate optimizers for different dtypes.
+        all_params = [p for g in self.param_groups for p in g["params"]]
+        device = all_params[0].device
+        has_bf16_params = any(p.dtype == torch.bfloat16 for p in all_params)
+
+        state = state_dict.get("state", {})
+        for idx in state:
+            param_state = state[idx]
+            if not isinstance(param_state, dict):
+                continue
+            replacements: dict[str, torch.Tensor] = {}
+            for key, qspec in spec.items():
+                t = param_state.get(key)
+                if not isinstance(t, torch.Tensor) or not t.is_floating_point():
+                    continue
+                if hasattr(t, "to_local"):
+                    t = t.to_local()
+                q, s = quantize(
+                    t.to(device),
+                    signed=qspec.signed,
+                    sqrt=qspec.sqrt,
+                    softsign=qspec.softsign,
+                )
+                if has_bf16_params:
+                    s = s.view(dtype=torch.bfloat16)
+                replacements[key] = (q, s)
+            if replacements:
+                # Shallow-copy to avoid mutating the source optimizer's state
+                param_state = dict(param_state)
+                for key, (q, s) in replacements.items():
+                    del param_state[key]
+                    param_state[f"{key}::quantized"] = q
+                    param_state[f"{key}::scales"] = s
+                state[idx] = param_state
 
     def _ensure_state_initialized(
         self, p: torch.Tensor, hparams: dict[str, Any]
@@ -1001,7 +1085,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         p_local = self._get_local_tensor(p)
 
         quantize = hparams.get("quantize", self._quantize)
-        for key_quant, spec in self._quantized_state_spec().items():
+        for key_quant, spec in self.quantized_state_spec.items():
             if key_quant not in state:
                 state[key_quant] = _MaybeQuantizedTensor(
                     self._initial_value_for_state_var(p_local, key_quant),
@@ -1250,7 +1334,7 @@ class FlashLion(FlashOptimizer):
         weight_decay: float = 0,
         decouple_lr: bool = False,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Literal[24, 32] | None = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -1351,6 +1435,14 @@ class FlashSGD(FlashOptimizer):
     For decoupled weight decay, use :class:`FlashSGDW`.
     See :class:`FlashOptimizer` for the non-SGD specific arguments.
 
+    .. note::
+        Unlike ``torch.optim.SGD``, which skips dampening on the first step
+        (``buf = grad.clone()``), FlashSGD applies ``(1 - dampening)`` uniformly
+        on every step including the first.  When ``dampening == 0`` (the default)
+        both implementations are equivalent.  For ``dampening > 0`` the first
+        momentum-buffer value will differ by a factor of ``(1 - dampening)``;
+        the discrepancy decays exponentially with subsequent steps.
+
     Args:
         params: Iterable of parameters to optimize or dicts defining
             parameter groups.
@@ -1377,7 +1469,7 @@ class FlashSGD(FlashOptimizer):
         weight_decay: float = 0.0,
         nesterov: bool = False,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Literal[24, 32] | None = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -1697,7 +1789,7 @@ def _triton_momentum_kernel(
         if QUANTIZE_OPTIM_STATES:
             # Quantize the momentum (absmax -> normalize -> softsign -> quantize)
             mom_groups = mom_f32.reshape((num_groups_per_block, GROUP_SIZE))
-            # 1. Absmax on raw values — safe for partial groups (N % BLOCK_SIZE_N != 0)
+            # 1. Absmax on raw values - safe for partial groups (N % BLOCK_SIZE_N != 0)
             # because zero-padded tail elements can't increase the max.
             absmaxs = tl.max(tl.abs(mom_groups), axis=1)
             absmaxs = tl.maximum(absmaxs, 1e-12)  # avoid div by zero
@@ -1715,7 +1807,7 @@ def _triton_momentum_kernel(
                 scales_ptr + scales_offsets, absmaxs.to(tl.float16), mask=scales_mask
             )
         else:
-            # Store momentum at param precision
+            # Store momentum in param dtype (no quantization)
             tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
 
 
@@ -1756,7 +1848,7 @@ class FlashSGDW(FlashSGD):
         nesterov: bool = False,
         decouple_lr: bool = False,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -1812,7 +1904,7 @@ class FlashAdam(FlashOptimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.0,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Literal[24, 32] | None = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -1848,9 +1940,8 @@ class FlashAdam(FlashOptimizer):
     ) -> None:
         super()._ensure_state_initialized(p, hparams)
         state = self.state[p]
-        # note: pytorch optimizers use float32 for checkpointed params
         if "step" not in state:
-            state["step"] = torch.tensor(0, dtype=torch.float32, device="cpu")
+            state["step"] = torch.tensor(0, dtype=torch.int64, device="cpu")
 
     def _min_step_size_relative_to_lr(self) -> float:
         # Returns a pragmatic heuristic for the minimum effective step size relative to the
@@ -1928,8 +2019,8 @@ class FlashAdam(FlashOptimizer):
         exp_avg = param_state["exp_avg"]
         exp_avg_sq = param_state["exp_avg_sq"]
 
-        # step is a CPU tensor (for checkpointing); 0-dim CPU tensors don't
-        # cause a device sync. The fused path converts to int for Triton.
+        # step is a CPU int64 tensor (for checkpointing); 0-dim CPU tensors
+        # don't cause a device sync.
         param_state["step"] += 1
         step = param_state["step"]
 
@@ -1942,7 +2033,7 @@ class FlashAdam(FlashOptimizer):
 
         # Apply weight decay to gradient if not decoupled
         if not decoupled and weight_decay > 0:
-            grad_f32 = grad_f32.add(param_f32, alpha=weight_decay)
+            grad_f32.add_(param_f32, alpha=weight_decay)
 
         # Update biased first moment estimate
         exp_avg_f32.mul_(beta1).add_(grad_f32, alpha=1 - beta1)
@@ -2011,7 +2102,7 @@ class FlashAdamW(FlashAdam):
         weight_decay: float = 1e-2,
         decouple_lr: bool = False,
         quantize: bool = True,
-        compress_state_dict: bool = False,
+        compress_state_dict: bool = True,
         master_weight_bits: Optional[Literal[24, 32]] = 24,
         check_numerics: bool = False,
         fused: bool = True,
@@ -2101,11 +2192,11 @@ def cast_model(
         full_precision_layers: Layers to keep in fp32 with no output recast.
             Accepts fnmatch patterns on dotted module names (e.g., `"lm_head"`,
             `"*.head"`, `"layers.*.attn"`) or direct module references
-            (e.g., `model.lm_head`).  Input hook only — fp32 output is
+            (e.g., `model.lm_head`).  Input hook only - fp32 output is
             preserved.  Use for terminal layers (lm_head, classifier).
         full_precision_recast_layers: Layers to keep in fp32 with output
             recast to *dtype*.  Same matching rules as *full_precision_layers*.
-            Input hook + output hook — output is cast back to *dtype*.
+            Input hook + output hook - output is cast back to *dtype*.
             Use for middle layers followed by bf16 compute.
 
     .. NOTE::
@@ -2394,7 +2485,7 @@ def _triton_adam_kernel(
             var_groups = var_sqrt.reshape((num_groups_per_block, GROUP_SIZE))
 
             # Absmax -> scale -> transform
-            # 1. Absmax on RAW values — safe for partial groups (N % BLOCK_SIZE_N != 0)
+            # 1. Absmax on RAW values - safe for partial groups (N % BLOCK_SIZE_N != 0)
             # because zero-padded tail elements can't increase the max.
             mom_absmaxs = tl.max(tl.abs(mom_groups), axis=1)
             var_absmaxs = tl.max(
@@ -2433,7 +2524,7 @@ def _triton_adam_kernel(
                 mask=scales_mask,
             )
         else:
-            # Store states at param precision
+            # Store momentum and variance in param dtype (no quantization)
             tl.store(mom_ptr + absolute_offsets, mom_f32.to(PARAM_DTYPE), mask=mask)
             tl.store(var_ptr + absolute_offsets, var_f32.to(PARAM_DTYPE), mask=mask)
 
@@ -2651,7 +2742,7 @@ def _triton_quantize_kernel(
             x_f32 = tl.sqrt(x_f32)
 
         # Absmax -> scale -> transform
-        # 1. Absmax on RAW values (after sqrt if enabled) — safe for partial groups
+        # 1. Absmax on RAW values (after sqrt if enabled) - safe for partial groups
         # (N % BLOCK_SIZE_N != 0) because zero-padded tail elements can't increase the max.
         groups = x_f32.reshape((num_groups_per_block, GROUP_SIZE))
         absmaxs = tl.max(tl.abs(groups), axis=1)
@@ -2717,7 +2808,7 @@ def _log_ulp_for_mantissa(f: tl.tensor, mantissa_bits: tl.constexpr) -> tl.tenso
     """Calculates the gap between f and the next representable float."""
     # ULP is 2^(exponent - mantissa_bits).
     # For f == 0 or subnormals, _get_unbiased_exponent returns 1 - bias,
-    # so this yields log2(smallest_subnormal) — the correct ULP for the
+    # so this yields log2(smallest_subnormal) - the correct ULP for the
     # entire subnormal range (all subnormals are evenly spaced).
     exponent = _get_unbiased_exponent(f, mantissa_bits)
     return exponent - mantissa_bits
@@ -2776,6 +2867,13 @@ def _apply_error_correction(
     return x_recon + e
 
 
+def _make_ecc_grid(N: int, meta: dict[str, int]) -> tuple[int]:
+    blocks_per_sm_target = meta.get("num_ctas", 2)
+    total_num_blocks = triton.cdiv(N, meta["BLOCK_SIZE"])
+    grid_dim = min(blocks_per_sm_target * _get_sm_count(), total_num_blocks)
+    return (grid_dim,)
+
+
 @triton.jit
 def _reconstruct_fp32_kernel(
     x_ptr,
@@ -2788,19 +2886,22 @@ def _reconstruct_fp32_kernel(
 ):
     """Kernel to reconstruct fp32 weights from narrow dtype + ECC bits."""
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    num_blocks_launched = tl.num_programs(0)
+    total_num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    for block_idx in range(pid, total_num_blocks, num_blocks_launched):
+        offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
-    x_narrow = tl.load(x_ptr + offsets, mask=mask, other=0)
-    ecc = tl.load(ecc_ptr + offsets, mask=mask, other=0)
+        x_narrow = tl.load(x_ptr + offsets, mask=mask, other=0)
+        ecc = tl.load(ecc_ptr + offsets, mask=mask, other=0)
 
-    result_f32 = _apply_error_correction(
-        x_narrow,
-        ecc,
-        NUM_MANTISSA_BITS,
-        SIGNED_MAX_VAL,
-    )
-    tl.store(out_ptr + offsets, result_f32, mask=mask)
+        result_f32 = _apply_error_correction(
+            x_narrow,
+            ecc,
+            NUM_MANTISSA_BITS,
+            SIGNED_MAX_VAL,
+        )
+        tl.store(out_ptr + offsets, result_f32, mask=mask)
 
 
 @triton.jit
@@ -2816,20 +2917,23 @@ def _compute_ecc_bits_kernel(
 ):
     """Kernel to compute ECC bits from fp32 and narrow dtype weights."""
     pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    num_blocks_launched = tl.num_programs(0)
+    total_num_blocks = tl.cdiv(n_elements, BLOCK_SIZE)
+    for block_idx in range(pid, total_num_blocks, num_blocks_launched):
+        offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
-    fp32_val = tl.load(fp32_ptr + offsets, mask=mask, other=0.0)
-    narrow_val = tl.load(narrow_ptr + offsets, mask=mask, other=0.0)
+        fp32_val = tl.load(fp32_ptr + offsets, mask=mask, other=0.0)
+        narrow_val = tl.load(narrow_ptr + offsets, mask=mask, other=0.0)
 
-    ecc = _compute_ecc_bits(
-        fp32_val,
-        narrow_val,
-        SIGNED_ERROR_T,
-        NUM_MANTISSA_BITS,
-        SIGNED_MAX_VAL,
-    )
-    tl.store(ecc_out_ptr + offsets, ecc, mask=mask)
+        ecc = _compute_ecc_bits(
+            fp32_val,
+            narrow_val,
+            SIGNED_ERROR_T,
+            NUM_MANTISSA_BITS,
+            SIGNED_MAX_VAL,
+        )
+        tl.store(ecc_out_ptr + offsets, ecc, mask=mask)
 
 
 def reconstruct_fp32_param(
@@ -2871,7 +2975,7 @@ def reconstruct_fp32_param(
     # Apply ECC reconstruction for int8/int16 error bits
     BLOCK_SIZE = 1024
     n = param.numel()
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
+    grid = functools.partial(_make_ecc_grid, n)
     out = torch.empty(param.shape, dtype=torch.float32, device=param.device)
     signed_max_val = 127 if error_bits.element_size() == 1 else 32767
 
@@ -2949,7 +3053,7 @@ def compute_ecc_bits(
 
     BLOCK_SIZE = 1024
     n = narrow_param.numel()
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
+    grid = functools.partial(_make_ecc_grid, n)
     out = torch.empty(narrow_param.shape, dtype=error_dtype, device=narrow_param.device)
 
     # Ensure tensors are contiguous for view operations
@@ -2975,6 +3079,7 @@ def compute_ecc_bits(
 
 @functools.cache
 def _get_sm_count(device: Optional[torch.device] = None):
+    # We use cuda:0 and we only support multi-gpu homogeneous systems
     if device is None:
         device = torch.device("cuda:0")
     return torch.cuda.get_device_properties(device).multi_processor_count
@@ -3032,7 +3137,9 @@ def _register_plain_hooks(
     for p in model.parameters():
         if not p.requires_grad:
             continue
-        group = param_to_group[id(p)]
+        group = param_to_group.get(id(p))
+        if group is None:
+            continue
 
         def _make_hook(p: torch.Tensor, group: dict[str, Any]) -> Callable:
             weak_opt = weakref.ref(optimizer)
@@ -3041,9 +3148,8 @@ def _register_plain_hooks(
                 opt = weak_opt()
                 if opt is None or p.grad is None:
                     return
-                if pre_step is not None and not pre_step(p, group):
-                    return
-                opt.step_param(p, group)
+                if pre_step is None or pre_step(p, group):
+                    opt.step_param(p, group)
                 p.grad = None
 
             return hook
@@ -3092,11 +3198,11 @@ def enable_gradient_release(
         raise NotImplementedError(
             "GradScaler integration with enable_gradient_release is not yet implemented. "
             "Per-parameter unscaling requires multiplying each grad by 1/scale, "
-            "checking for inf, and skipping steps on inf — this is planned but "
+            "checking for inf, and skipping steps on inf - this is planned but "
             "not yet available."
         )
 
-    # Reject FSDP1 — its resharding lifecycle is incompatible with gradient
+    # Reject FSDP1 - its resharding lifecycle is incompatible with gradient
     # release.  FSDP2 (fully_shard / FSDPModule) is supported and falls
     # through to _register_plain_hooks below.
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -3108,7 +3214,7 @@ def enable_gradient_release(
             "with per-parameter gradient release."
         )
 
-    # Reject DDP — its reducer unconditionally copies the (zeroed) bucket
+    # Reject DDP - its reducer unconditionally copies the (zeroed) bucket
     # buffer back into p.grad after the comm hook future resolves, leaking
     # gradient memory.  No Python hook fires after this copy-back, so the
     # leak cannot be prevented.  Benchmarks also show that stepping inside

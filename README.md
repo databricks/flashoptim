@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/databricks/flashoptim/refs/heads/assets/imgs/flashoptim_ithaca_italic.png" alt="FlashOptim" width="650">
 
-This is the official implementation of [FlashOptim: Optimizers for Memory Efficient Training](https://arxiv.org/abs/2602.23349)
+This is the official implementation of [FlashOptim: Optimizers for Memory-Efficient Training](https://arxiv.org/abs/2602.23349)
 
 By [Jose Javier Gonzalez Ortiz](https://x.com/jjgort), [Abhay Gupta](https://x.com/gupta__abhay), [Christopher Rinard](https://x.com/ChrisRinard), and [Davis Blalock](https://x.com/davisblalock).
 
@@ -119,10 +119,10 @@ from flashoptim import cast_model
 # Cast all parameters to bf16 (normalization layers kept in fp32 by default)
 cast_model(model, dtype=torch.bfloat16)
 
-# Terminal layers (e.g., lm_head) — kept fp32, output stays fp32
+# Terminal layers (e.g., lm_head) - kept fp32, output stays fp32
 cast_model(model, dtype=torch.bfloat16, full_precision_layers=["lm_head", "*.head"])
 
-# Middle layers — kept fp32 but output recast to bf16
+# Middle layers - kept fp32 but output recast to bf16
 cast_model(model, dtype=torch.bfloat16, full_precision_recast_layers=["target"])
 
 # Module references work too
@@ -194,20 +194,25 @@ optimizer.set_fp32_model_state_dict(model, fp32_state_dict)
 
 ### Compressed Checkpoints
 
-By default, optimizer state dicts are saved with states cast to bf16, which is already smaller than fp32. For additional savings, set `compress_state_dict=True` when constructing the optimizer to quantize states to int8, producing checkpoints ~50% smaller than bf16:
+By default, optimizer state dicts are saved in compressed form (quantized int8 momentum and variance), producing checkpoints ~50% smaller than fp32. ECC error correction bits are always preserved in the checkpoint regardless of this setting. To disable compression and save optimizer states as fp32 instead, set `compress_state_dict=False`:
 
 ```python
-# Default: state_dict() saves states as bf16
+# Default: state_dict() saves states as quantized int8
 optimizer = FlashAdamW(model.parameters(), lr=1e-3)
-torch.save(optimizer.state_dict(), "checkpoint_bf16.pt")
-
-# Compressed: state_dict() saves states as quantized int8
-optimizer = FlashAdamW(model.parameters(), lr=1e-3, compress_state_dict=True)
 torch.save(optimizer.state_dict(), "checkpoint_int8.pt")
+
+# Uncompressed: state_dict() saves states as fp32
+optimizer = FlashAdamW(model.parameters(), lr=1e-3, compress_state_dict=False)
+torch.save(optimizer.state_dict(), "checkpoint_fp32.pt")
 ```
 
-> [!NOTE]
-> Compressed state dicts are **not** loadable by vanilla PyTorch optimizers. They can only be loaded back by FlashOptim optimizers using `optimizer.load_state_dict()`.
+> [!WARNING]
+> **Checkpoint precision gotcha.** PyTorch's `Optimizer.load_state_dict()` casts every floating-point state tensor to the parameter's dtype (e.g. fp32 → bf16), which is lossy. FlashOptim works around this, but behavior differs by mode:
+>
+> - **`compress_state_dict=True`** (default) - Optimizer states (momentum, variance) are serialized as int8 + fp16 scales and are **not** loadable by vanilla PyTorch optimizers.
+> - **`compress_state_dict=False`** - Optimizer states are serialized as fp32 and are loadable by vanilla PyTorch optimizers. On load, FlashOptim pre-quantizes them to int8 + scales *before* PyTorch's cast runs, avoiding the lossy bf16 conversion. This recovers most precision but introduces one extra quantization step compared to continuous training.
+>
+> Note: `compress_state_dict` only affects how optimizer states (momentum, variance) are serialized. ECC error correction bits are always included in both modes and are not affected by this setting.
 
 ### Distributed Training
 
@@ -309,7 +314,7 @@ If you use FlashOptim in your research, please cite our paper:
 
 ```bibtex
 @article{gonzalezblalock2026flashoptim,
-  title={FlashOptim: Optimizers for Memory Efficient Training},
+  title={FlashOptim: Optimizers for Memory-Efficient Training},
   author={Gonzalez Ortiz, Jose Javier and Gupta, Abhay and Rinard, Christopher and Blalock, Davis},
   journal={arXiv preprint arXiv:2602.23349},
   year={2026}

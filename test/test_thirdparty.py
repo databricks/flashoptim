@@ -126,7 +126,7 @@ def _register_timm():
         "resnet50",  # BatchNorm int buffers (num_batches_tracked)
         "vit_base_patch16_224",  # position embeddings, multi-head attention
         "swin_tiny_patch4_window7_224",  # relative_position_index int buffer (original bug)
-        "mixer_b16_224",  # pure MLP — no conv, no attention
+        "mixer_b16_224",  # pure MLP - no conv, no attention
     ]
     _add(
         "timm",
@@ -259,7 +259,7 @@ def _register_transformers():
             ("facebook/sam-vit-base", _build_sam, _sam_input, None),
             # Text-only CLIP encoder
             ("CLIPTextModel", _build_clip_text, _clip_text_input, None),
-            # Pure SSM — no attention (selective state spaces)
+            # Pure SSM - no attention (selective state spaces)
             (
                 "state-spaces/mamba-130m-hf",
                 _build("state-spaces/mamba-130m-hf", AutoModelForCausalLM),

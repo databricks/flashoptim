@@ -42,7 +42,7 @@ _OPT_CONFIGS = [SGDM_CONFIG, LION_CONFIG, ADAMW_CONFIG]
 
 
 # ---------------------------------------------------------------------------
-# Helpers — return error lists instead of raising to avoid rank divergence
+# Helpers - return error lists instead of raising to avoid rank divergence
 # ---------------------------------------------------------------------------
 
 
@@ -225,7 +225,7 @@ def _run_single_ddp_config(
     lr = 0.001
     dataset = ToyDataset(n=128, d_in=d_in, d_out=d_out, seed=seed)
 
-    # Collect all errors — never raise mid-loop to avoid rank divergence
+    # Collect all errors - never raise mid-loop to avoid rank divergence
     all_errors: list[str] = []
 
     # ===== MODEL CREATION (ALL RANKS) =====
@@ -487,3 +487,79 @@ def _run_ddp_gradient_release_rejected(rank: int, world_size: int) -> None:
 def test_ddp_gradient_release_rejected(ddp_runner) -> None:
     """enable_gradient_release() must reject DDP models with a clear error."""
     ddp_runner(_run_ddp_gradient_release_rejected)
+
+
+def _run_ddp_frozen_params(
+    rank: int, world_size: int, opt_config: OptimizerTestConfig, seed: int
+) -> None:
+    """DDP training with frozen params: frozen params stay unchanged, no state allocated."""
+    device = torch.device(f"cuda:{rank}")
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    d_in, d_out = 10, 5
+    model = _create_simple_model(d_in, d_out).to(device=device)
+
+    # Freeze weight matrices, keep biases trainable
+    model[0].weight.requires_grad = False
+    model[2].weight.requires_grad = False
+
+    frozen_params_orig = {
+        name: p.clone() for name, p in model.named_parameters() if not p.requires_grad
+    }
+
+    dist.barrier()
+    model_ddp = DDP(model, device_ids=[device.index])
+
+    opt = opt_config.factory(model_ddp.parameters(), lr=0.01, check_numerics=False)
+
+    loss_fn = nn.MSELoss()
+    all_errors: list[str] = []
+
+    for _step in range(5):
+        x = torch.randn(8, d_in, device=device)
+        y = torch.randn(8, d_out, device=device)
+
+        opt.zero_grad(set_to_none=True)
+        loss = loss_fn(model_ddp(x), y)
+        loss.backward()
+        opt.step()
+
+    # Verify frozen params unchanged
+    for name, p in model.named_parameters():
+        if name in frozen_params_orig:
+            if not torch.equal(p, frozen_params_orig[name]):
+                all_errors.append(f"[Rank {rank}] Frozen param {name} was modified")
+
+    # Verify frozen params have no optimizer state
+    for p in model.parameters():
+        if not p.requires_grad and p in opt.state:
+            all_errors.append(f"[Rank {rank}] Frozen param has optimizer state")
+
+    # Verify trainable params have state
+    for p in model.parameters():
+        if p.requires_grad and p not in opt.state:
+            all_errors.append(f"[Rank {rank}] Trainable param missing optimizer state")
+
+    has_errors = torch.tensor([1 if all_errors else 0], device=device)
+    dist.all_reduce(has_errors, op=dist.ReduceOp.MAX)
+
+    if has_errors.item() > 0:
+        if all_errors:
+            raise AssertionError("\n".join(all_errors))
+        else:
+            raise AssertionError(f"[Rank {rank}] Another rank reported errors")
+
+    del model_ddp, opt
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=lambda c: c.name)
+def test_ddp_frozen_params(
+    opt_config: OptimizerTestConfig, seed: int, ddp_runner
+) -> None:
+    """DDP training with frozen params works correctly."""
+    ddp_runner(_run_ddp_frozen_params, opt_config, seed)
