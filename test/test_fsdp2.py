@@ -1132,3 +1132,132 @@ def test_fsdp2_dcp_training_continuation(
         str(tmp_path / "ckpt"),
         seed,
     )
+
+
+# ============================================================================
+# FSDP2 uneven-shard state_dict test
+# ============================================================================
+
+
+def _run_fsdp2_uneven_shard_state_dict(
+    rank: int,
+    world_size: int,
+    ckpt_dir: str,
+    seed: int,
+) -> None:
+    """Unevenly sharded params: global shape not divisible by world_size.
+
+    Verifies that optimizer state tensors are wrapped as DTensors whose global
+    shape matches the param's global shape — not ``local_size * world_size``,
+    which ``DTensor.from_local``'s default inference would produce — and that
+    DCP save + load round-trips exactly.
+    """
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+    from torch.distributed.tensor import DTensor
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    # Shapes chosen so no dim divides evenly by world_size=2:
+    #   Linear(10, 7) -> weight [7, 10], bias [7]
+    #   Linear(7, 5)  -> weight [5, 7],  bias [5]
+    d_in, d_out, hidden_dim = 10, 5, 7
+    dtype = torch.bfloat16
+    lr = 0.001
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model = _create_simple_model(d_in, d_out, hidden_dim=hidden_dim).to(
+        device=device, dtype=dtype
+    )
+    dist.barrier()
+    fully_shard(model)
+
+    # Capture global param shapes for later correctness checks.
+    param_shapes = {name: tuple(p.shape) for name, p in model.named_parameters()}
+
+    # Sanity: at least one param must be unevenly sharded on its sharded dim.
+    uneven_seen = any(
+        p.shape[placement.dim] % p.device_mesh.size(mesh_dim) != 0
+        for p in model.parameters()
+        if isinstance(p, DTensor)
+        for mesh_dim, placement in enumerate(p.placements)
+        if hasattr(placement, "dim")
+    )
+    assert uneven_seen, "Test setup failed: no uneven shards produced"
+
+    opt = ADAMW_CONFIG.factory(
+        model.parameters(),
+        lr=lr,
+        compress_state_dict=False,
+        master_weight_bits=None,
+    )
+    loss_fn = nn.MSELoss()
+
+    g = torch.Generator(device=device).manual_seed(seed + rank)
+    for _ in range(3):
+        x = torch.randn(4, d_in, device=device, dtype=dtype, generator=g)
+        y = torch.randn(4, d_out, device=device, dtype=dtype, generator=g)
+        loss_fn(model(x), y).backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    # --- Verify wrapped DTensors carry the correct global shape ---
+    saved_osd = get_optimizer_state_dict(model, opt)
+    for fqn, param_state in saved_osd["state"].items():
+        expected_shape = param_shapes[fqn]
+        for key, val in param_state.items():
+            if isinstance(val, DTensor) and val.dim() > 0:
+                assert tuple(val.shape) == expected_shape, (
+                    f"[Rank {rank}] state[{fqn}].{key} wrapped with global shape "
+                    f"{tuple(val.shape)}, expected {expected_shape}"
+                )
+
+    # --- DCP save + load roundtrip ---
+    dcp.save({"optimizer": saved_osd}, checkpoint_id=ckpt_dir)
+    dist.barrier()
+
+    loaded_osd = get_optimizer_state_dict(model, opt)
+    dcp.load({"optimizer": loaded_osd}, checkpoint_id=ckpt_dir)
+
+    for fqn in saved_osd["state"]:
+        for key in saved_osd["state"][fqn]:
+            v_saved = saved_osd["state"][fqn][key]
+            v_loaded = loaded_osd["state"][fqn][key]
+            if isinstance(v_saved, torch.Tensor) and v_saved.dim() > 0:
+                vs = v_saved.to_local() if hasattr(v_saved, "to_local") else v_saved
+                vl = v_loaded.to_local() if hasattr(v_loaded, "to_local") else v_loaded
+                assert torch.equal(vs, vl), (
+                    f"[Rank {rank}] state[{fqn}].{key} changed after "
+                    f"DCP roundtrip: max diff = "
+                    f"{(vs.float() - vl.float()).abs().max().item()}"
+                )
+
+    set_optimizer_state_dict(model, opt, loaded_osd)
+
+    x = torch.randn(4, d_in, device=device, dtype=dtype)
+    y = torch.randn(4, d_out, device=device, dtype=dtype)
+    loss_fn(model(x), y).backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+    del model, opt
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
+def test_fsdp2_uneven_shard_state_dict(
+    seed: int,
+    fsdp2_runner,
+    tmp_path,
+) -> None:
+    fsdp2_runner(
+        _run_fsdp2_uneven_shard_state_dict,
+        str(tmp_path / "ckpt"),
+        seed,
+    )
