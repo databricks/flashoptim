@@ -629,16 +629,6 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         DCP requires optimizer state tensors to carry the same DTensor metadata
         (mesh, placements) as their corresponding parameters. Without this,
         DCP treats local shards as replicated data and scrambles them on load.
-
-        For state tensors whose local shape matches the param's local shape
-        (e.g. uncompressed momentum/variance), we pass ``shape`` and ``stride``
-        explicitly so wrapping is correct for both even and uneven shards —
-        ``DTensor.from_local``'s default global-shape inference (which
-        multiplies each sharded dim's local size by its mesh-dim size) is only
-        right for even splits. For tensors with a different layout (e.g.
-        quantized state, which has its own packed shape), we fall back to
-        default inference; that path is only correct for even shards, which
-        is a known limitation outside this function's scope.
         """
         if not hasattr(param, "device_mesh"):
             return
@@ -648,23 +638,41 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         placements = param.placements
         param_local_shape = param.to_local().shape
 
+        uneven = any(
+            param.shape[p.dim] % mesh.size(i) != 0
+            for i, p in enumerate(placements)
+            if hasattr(p, "dim")
+        )
+
         for key, val in state.items():
-            if (
+            if not (
                 isinstance(val, torch.Tensor)
                 and not isinstance(val, DTensor)
                 and val.dim() > 0
             ):
-                if val.shape == param_local_shape:
-                    state[key] = DTensor.from_local(
-                        val,
-                        mesh,
-                        placements,
-                        shape=param.shape,
-                        stride=param.stride(),
-                        run_check=False,
-                    )
-                else:
-                    state[key] = DTensor.from_local(val, mesh, placements)
+                continue
+            if val.shape == param_local_shape:
+                # Pass explicit shape/stride so wrapping is correct on uneven shards.
+                state[key] = DTensor.from_local(
+                    val,
+                    mesh,
+                    placements,
+                    shape=param.shape,
+                    stride=param.stride(),
+                    run_check=False,
+                )
+            elif uneven:
+                # e.g. quantized state with a packed shape: default inference
+                # would scramble DCP on uneven shards, and we have no global
+                # shape for this layout. Fail loudly rather than silently.
+                raise ValueError(
+                    f"Cannot safely wrap state tensor {key!r} of shape "
+                    f"{tuple(val.shape)} as a DTensor for unevenly-sharded "
+                    f"param of shape {tuple(param.shape)}: its layout does "
+                    f"not match the param, so the global shape is unknown."
+                )
+            else:
+                state[key] = DTensor.from_local(val, mesh, placements)
 
     def _recompute_stats_for_param(self, p: torch.Tensor) -> None:
         p_for_stats = self._get_tensor_for_stats(p)
