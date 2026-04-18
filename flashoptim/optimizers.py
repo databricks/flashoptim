@@ -630,12 +630,15 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         (mesh, placements) as their corresponding parameters. Without this,
         DCP treats local shards as replicated data and scrambles them on load.
 
-        For state tensors whose local shape matches the param's local shape,
-        we pass ``shape`` and ``stride`` explicitly so wrapping is correct for
-        both even and uneven shards — ``DTensor.from_local``'s default global
-        shape inference (``local_size * world_size``) is only right for even
-        splits. For tensors with a different layout (e.g. quantized state,
-        which has its own packed shape), we fall back to default inference.
+        For state tensors whose local shape matches the param's local shape
+        (e.g. uncompressed momentum/variance), we pass ``shape`` and ``stride``
+        explicitly so wrapping is correct for both even and uneven shards —
+        ``DTensor.from_local``'s default global-shape inference (which
+        multiplies each sharded dim's local size by its mesh-dim size) is only
+        right for even splits. For tensors with a different layout (e.g.
+        quantized state, which has its own packed shape), we fall back to
+        default inference; that path is only correct for even shards, which
+        is a known limitation outside this function's scope.
         """
         if not hasattr(param, "device_mesh"):
             return
