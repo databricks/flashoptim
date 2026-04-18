@@ -5,7 +5,6 @@ import copy
 import tempfile
 from typing import Optional
 
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -26,7 +25,7 @@ _OPT_CONFIGS = [LION_CONFIG, SGDM_CONFIG, ADAMW_CONFIG]
 
 # AMP test thresholds (~3x worst observed, rounded to nice numbers).
 # autocast modes (fp16/bf16) are exact because the fp32 optimizer sees
-# fp32 master weights — only gradscaler and bf16_native introduce drift.
+# fp32 master weights - only gradscaler and bf16_native introduce drift.
 AMP_MIN_CORRELATION = 0.9999
 AMP_MAX_NMSE_GRADSCALER = 5e-4  # worst observed ~1.3e-4
 AMP_MAX_NMSE_BF16_NATIVE = 1e-4  # worst observed ~3.6e-5
@@ -79,17 +78,17 @@ def _compute_loss_nmse(losses_baseline: list[float], losses_test: list[float]) -
         "Loss trajectories must have same length"
     )
 
-    baseline = np.array(losses_baseline)
-    test = np.array(losses_test)
+    baseline = torch.tensor(losses_baseline)
+    test = torch.tensor(losses_test)
 
-    mse = np.mean((test - baseline) ** 2)
-    var_baseline = np.var(baseline)
+    mse = ((test - baseline) ** 2).mean()
+    var_baseline = baseline.var(correction=0)
 
     # Handle edge case where baseline has no variance
     if var_baseline < 1e-10:
-        return mse
+        return mse.item()
 
-    return mse / var_baseline
+    return (mse / var_baseline).item()
 
 
 def _compute_loss_correlation(
@@ -99,12 +98,10 @@ def _compute_loss_correlation(
         "Loss trajectories must have same length"
     )
 
-    baseline = np.array(losses_baseline)
-    test = np.array(losses_test)
+    baseline = torch.tensor(losses_baseline)
+    test = torch.tensor(losses_test)
 
-    # Use numpy's corrcoef which returns correlation matrix
-    # [0, 1] is the correlation between the two arrays
-    corr_matrix = np.corrcoef(baseline, test)
+    corr_matrix = torch.corrcoef(torch.stack([baseline, test]))
     return float(corr_matrix[0, 1])
 
 
@@ -116,7 +113,7 @@ def _create_simple_model(d_in: int, d_out: int, hidden_dim: int = 16) -> nn.Modu
     )
 
 
-# (quantize, master_weight_bits) — representative checkpoint configurations.
+# (quantize, master_weight_bits) - representative checkpoint configurations.
 # master_weight_bits=24 requires bf16 model (ECC is meaningless for fp32).
 _CKPT_CONFIGS = [
     (False, None),  # fp32, no quantization, no ECC
@@ -416,3 +413,170 @@ def test_joint_model_optimizer_checkpoint(
         cs = torch.cosine_similarity(po.ravel(), pf.ravel(), dim=0).item()
         assert cs > min_cossim, f"{n}: cossim={cs:.6f}"
         assert nmse(po.ravel(), pf.ravel()) < max_nmse, f"{n}: nmse too high"
+
+
+# ============================================================================
+# Frozen parameter training tests
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "use_gradient_release", [False, True], ids=["no_grad_release", "grad_release"]
+)
+def test_frozen_params_training(
+    opt_config: OptimizerTestConfig,
+    use_gradient_release: bool,
+) -> None:
+    """Training with a mix of frozen and trainable params.
+
+    Verifies that loss descends, frozen params stay unchanged, and trainable
+    params update correctly. Also tests with cast_model and gradient release.
+    """
+    from flashoptim import cast_model, enable_gradient_release
+
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    d_in, d_out = 10, 5
+    model = _create_simple_model(d_in, d_out).to("cuda", dtype=torch.bfloat16)
+
+    # Freeze weight matrices, keep biases trainable
+    model[0].weight.requires_grad = False
+    model[2].weight.requires_grad = False
+
+    frozen_params_orig = {
+        name: p.clone() for name, p in model.named_parameters() if not p.requires_grad
+    }
+
+    cast_model(model)
+
+    opt = opt_config.factory(
+        model.parameters(),
+        lr=0.01,
+        master_weight_bits=24,
+        check_numerics=False,
+    )
+
+    if use_gradient_release:
+        enable_gradient_release(model, opt)
+
+    dataset = ToyDataset(n=128, d_in=d_in, d_out=d_out, seed=0)
+    batches = _prepare_batches(dataset, 20, model_dtype=torch.bfloat16)
+
+    losses = _train_steps(model, opt, batches, 0, 20)
+
+    # Loss should descend
+    assert losses[-1] < losses[0], (
+        f"Loss did not descend: first={losses[0]:.4f}, last={losses[-1]:.4f}"
+    )
+
+    # Frozen params should be unchanged
+    for name, p in model.named_parameters():
+        if name in frozen_params_orig:
+            assert torch.equal(p, frozen_params_orig[name]), (
+                f"Frozen param {name} was modified during training"
+            )
+
+    # Frozen params should have no optimizer state
+    for p in model.parameters():
+        if not p.requires_grad:
+            assert p not in opt.state, "Frozen param should not have optimizer state"
+
+    # Trainable params should be finite
+    for p in model.parameters():
+        assert p.isfinite().all()
+
+
+# ============================================================================
+# Long-Horizon Convergence Tests
+# ============================================================================
+
+_HORIZON_CONFIGS = [
+    (torch.bfloat16, 24, True),  # quantized bf16 with ECC
+    (torch.float32, None, False),  # fp32 sanity baseline
+]
+
+
+def _horizon_config_id(cfg: tuple[torch.dtype, int | None, bool]) -> str:
+    dtype, ecc, quant = cfg
+    dtype_s = "bf16" if dtype == torch.bfloat16 else "fp32"
+    ecc_s = f"ecc{ecc}" if ecc else "noECC"
+    q_s = "quant" if quant else "noquant"
+    return f"{dtype_s}_{ecc_s}_{q_s}"
+
+
+@pytest.mark.parametrize("seed", [0, 1], ids=seed_id)
+@pytest.mark.parametrize("horizon_config", _HORIZON_CONFIGS, ids=_horizon_config_id)
+def test_long_horizon_convergence(
+    opt_config: OptimizerTestConfig,
+    seed: int,
+    horizon_config: tuple[torch.dtype, int | None, bool],
+) -> None:
+    """Train a linear model on a noiseless regression problem for 300 steps.
+
+    Checks:
+      - Convergence: final_loss / initial_loss < 0.01
+      - Proximity to optimum: ||W - W*|| / ||W*|| < 0.05
+      - Drift vs fp32 reference: Pearson correlation of loss trajectories > 0.999
+    """
+    dtype, ecc_bits, quantize = horizon_config
+    num_steps = 300
+    lr = 0.01
+    d_in, d_out = 16, 4
+    device = "cuda"
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    # Fixed dataset: Y = X @ W_true (no noise → unique minimum at W_true)
+    g = torch.Generator(device=device).manual_seed(seed + 1000)
+    X = torch.randn(64, d_in, device=device, generator=g)
+    W_true = torch.randn(d_in, d_out, device=device, generator=g) * 0.5
+    Y = X @ W_true
+
+    # --- Flash optimizer run ---
+    torch.manual_seed(seed)
+    model_flash = nn.Linear(d_in, d_out, bias=False, device=device, dtype=dtype)
+    opt_flash = opt_config.factory(
+        model_flash.parameters(),
+        lr=lr,
+        quantize=quantize,
+        master_weight_bits=ecc_bits,
+        check_numerics=False,
+    )
+    losses_flash: list[float] = []
+    for _ in range(num_steps):
+        opt_flash.zero_grad(set_to_none=True)
+        loss = ((model_flash(X.to(dtype=dtype)).float() - Y) ** 2).mean()
+        loss.backward()
+        opt_flash.step()
+        losses_flash.append(loss.item())
+
+    # --- Reference optimizer run (fp32, no quantization) ---
+    torch.manual_seed(seed)
+    model_ref = nn.Linear(d_in, d_out, bias=False, device=device, dtype=torch.float32)
+    opt_ref = opt_config.reference_factory(model_ref.parameters(), lr=lr)
+    losses_ref: list[float] = []
+    for _ in range(num_steps):
+        opt_ref.zero_grad(set_to_none=True)
+        loss = ((model_ref(X) - Y) ** 2).mean()
+        loss.backward()
+        opt_ref.step()
+        losses_ref.append(loss.item())
+
+    # --- Convergence: loss must drop by > 100× ---
+    loss_ratio = losses_flash[-1] / losses_flash[0]
+    assert loss_ratio < 0.01, (
+        f"Flash optimizer did not converge: final/initial = {loss_ratio:.6e}"
+    )
+
+    # --- Proximity to optimum ---
+    W_flash = model_flash.weight.data.float().T  # (d_in, d_out)
+    rel_err = (W_flash - W_true).norm().item() / W_true.norm().item()
+    assert rel_err < 0.05, (
+        f"Flash optimizer too far from optimum: ||W - W*|| / ||W*|| = {rel_err:.6f}"
+    )
+
+    # --- Drift: loss trajectory correlation with fp32 reference ---
+    corr = _compute_loss_correlation(losses_ref, losses_flash)
+    assert corr > 0.999, f"Loss trajectory correlation too low: {corr:.6f} (min: 0.999)"

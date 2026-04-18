@@ -80,7 +80,7 @@ def _check_roundtrip_quality(
     assert mae_val <= max_mae, f"MAE {mae_val} too high (max {max_mae})"
 
 
-# (test_case, seed) pairs — deterministic cases only need seed=0
+# (test_case, seed) pairs - deterministic cases only need seed=0
 _ROUNDTRIP_CASES = [
     ("zeros", 0),
     ("max_vals", 0),
@@ -94,7 +94,7 @@ def _case_seed_id(case_seed: tuple[str, int]) -> str:
     return f"{case_seed[0]}_seed{case_seed[1]}"
 
 
-# (signed, sqrt, softsign) — only the combos that matter in practice:
+# (signed, sqrt, softsign) - only the combos that matter in practice:
 # signed+softsign (exp_avg), unsigned+sqrt (exp_avg_sq), and plain baselines.
 _QUANT_MODE_COMBOS = [
     (True, False, False),  # plain signed

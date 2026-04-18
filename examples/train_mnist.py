@@ -126,7 +126,7 @@ def train_one_epoch(
         loss = F.cross_entropy(logits, labels[i : i + batch_size])
         loss.backward()
         # step() and zero_grad() are intentional no-ops when gradient release
-        # is active — parameters are updated by backward hooks instead.
+        # is active  - parameters are updated by backward hooks instead.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             optimizer.step()

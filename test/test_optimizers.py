@@ -1,11 +1,12 @@
 # Copyright 2026 Databricks AI Research authors
 
+import math
+import random
 import time
 import warnings
 from collections import OrderedDict
 from typing import Optional
 
-import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -28,9 +29,11 @@ from test_utils import (
     SGDMW_CONFIG,
     OptimizerTestConfig,
     ReferenceLion,
+    check_tensor_similarity,
     dtype_ecc_quant_fused_id,
     dtype_ecc_quant_id,
     dtype_id,
+    get_tolerances,
     lr_id,
     master_weight_bits_id,
     nmse,
@@ -49,7 +52,7 @@ from flashoptim.optimizers import (
 cossim = torch.cosine_similarity  # avoid ugly linewraps
 warnings.filterwarnings("ignore")
 
-np.set_printoptions(linewidth=160, formatter={"float": lambda f: f"{f:5.3f}"})
+torch.set_printoptions(linewidth=160)
 
 # Seeds for parametrized random testing
 SEEDS = list(range(3))
@@ -292,7 +295,7 @@ def test_descends(
         master_weight_bits=master_weight_bits,
     )
 
-    prev_loss = np.inf
+    prev_loss = math.inf
     prev_momentum = None
     num_iters = 10  # CUDA only
     prev_states = {}
@@ -625,7 +628,7 @@ def test_check_numerics(
     need_step = _log2_min_expressible_step_size(
         dtype, max_abs_value, _BITS_TO_BYTES[master_weight_bits]
     )
-    if np.log2(lr) < need_step:
+    if math.log2(lr) < need_step:
         with pytest.raises(NumericsError):
             optimizer.step()
     else:
@@ -656,7 +659,7 @@ def test_fused_as_fast_as_unfused(
             (N, D), dtype=dtype, device="cuda", requires_grad=False, generator=gen
         )
 
-        num_iters = int(np.ceil(min_elems_traversed / W.grad.numel()))
+        num_iters = math.ceil(min_elems_traversed / W.grad.numel())
         num_iters = min(100, num_iters)  # limit duration when overhead-bound
 
         times = {}
@@ -730,7 +733,7 @@ def test_ecc_increases_precision(
     D_in, D_out = 4096, 4096
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(seed)
-    numpy_rng = np.random.default_rng(seed)
+    rng = random.Random(seed)
 
     models = []
     for _ in range(3):  # 0-byte, 3-byte, 4-byte
@@ -757,14 +760,11 @@ def test_ecc_increases_precision(
                 -1.9999998807907104,  # 0xbfffffff - all-one mantissa
             ]
             # Randomly choose from candidates for entire tensor
-            chosen_indices = numpy_rng.choice(len(float_candidates), size=W.shape)
-            W_np = np.array(
-                [
-                    [float_candidates[chosen_indices[i, j]] for j in range(W.shape[1])]
-                    for i in range(W.shape[0])
-                ]
-            )
-            W.copy_(torch.from_numpy(W_np))
+            candidates = torch.tensor(float_candidates)
+            indices = torch.tensor(
+                rng.choices(range(len(float_candidates)), k=W.numel())
+            ).reshape(W.shape)
+            W.copy_(candidates[indices])
 
         else:  # init_mode == 'random'
             W.copy_(torch.randn(W.shape, device=W.device, dtype=W.dtype, generator=gen))
@@ -876,53 +876,88 @@ def test_ecc_increases_precision(
     )
 
 
+_GRAD_RELEASE_CONFIGS = [
+    (False, torch.float32, None),  # fp32, no quant, no ECC
+    (True, torch.bfloat16, 24),  # bf16, quantized, 24-bit ECC
+]
+
+
+def _grad_release_config_id(cfg: tuple) -> str:
+    quant, dtype, mwb = cfg
+    dtype_s = {torch.float32: "fp32", torch.bfloat16: "bf16"}[dtype]
+    q_s = "quant" if quant else "noquant"
+    ecc_s = f"ecc{mwb}" if mwb else "noecc"
+    return f"{dtype_s}_{q_s}_{ecc_s}"
+
+
+@pytest.mark.parametrize(
+    "grad_release_cfg",
+    _GRAD_RELEASE_CONFIGS,
+    ids=[_grad_release_config_id(c) for c in _GRAD_RELEASE_CONFIGS],
+)
 @pytest.mark.parametrize("seed", SEEDS, ids=seed_id)
 def test_gradient_release_matches_manual_step(
-    opt_config: OptimizerTestConfig, seed: int
+    opt_config: OptimizerTestConfig, seed: int, grad_release_cfg: tuple
 ):
     """Test that enable_gradient_release produces identical results to explicit step/zero_grad."""
     from flashoptim import enable_gradient_release
 
+    quantize, dtype, master_weight_bits = grad_release_cfg
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(seed)
-    dtype = torch.float32
-    N, D = 32, 5
+    D = 32
 
     X = torch.randn(
-        (N, D), device=device, requires_grad=False, dtype=dtype, generator=gen
+        (64, D), device=device, requires_grad=False, dtype=dtype, generator=gen
     )
 
-    # Create two identical modules
-    W_init = torch.randn((D, D), device=device, dtype=dtype, generator=gen)
+    # Create two identical 2-layer models
+    def _make_model():
+        m = nn.Sequential(
+            nn.Linear(D, D, bias=False, device=device, dtype=dtype),
+            nn.ReLU(),
+            nn.Linear(D, D, bias=False, device=device, dtype=dtype),
+        )
+        return m
 
-    model_release = nn.Linear(D, D, bias=False, device=device, dtype=dtype)
-    model_manual = nn.Linear(D, D, bias=False, device=device, dtype=dtype)
-    with torch.no_grad():
-        model_release.weight.copy_(W_init)
-        model_manual.weight.copy_(W_init)
+    W_init_state = _make_model().state_dict()
 
-    kwargs = {
-        "lr": 1e-2,
-        "quantize": False,
-        "check_numerics": False,
-    }
-    opt_release = opt_config.factory(model_release.parameters(), **kwargs)
-    opt_manual = opt_config.factory(model_manual.parameters(), **kwargs)
+    model_release = _make_model()
+    model_manual = _make_model()
+    model_release.load_state_dict(W_init_state)
+    model_manual.load_state_dict(W_init_state)
+
+    opt_release = opt_config.factory(
+        model_release.parameters(),
+        lr=1e-2,
+        quantize=quantize,
+        master_weight_bits=master_weight_bits,
+        check_numerics=False,
+    )
+    opt_manual = opt_config.factory(
+        model_manual.parameters(),
+        lr=1e-2,
+        quantize=quantize,
+        master_weight_bits=master_weight_bits,
+        check_numerics=False,
+    )
 
     handle = enable_gradient_release(model_release, opt_release)
 
-    prev_loss_release = np.inf
-    prev_loss_manual = np.inf
+    tol = get_tolerances(dtype, quantize)
+
+    prev_loss_release = math.inf
+    prev_loss_manual = math.inf
     for _ in range(3):
         # Gradient release: backward triggers hook → step + free grad
-        Y_release = X @ model_release.weight.T
-        loss_release = (Y_release * Y_release).mean()
+        Y_release = model_release(X)
+        loss_release = (Y_release.float() * Y_release.float()).mean()
         loss_release.backward()
         # step/zero_grad are no-ops in gradient release mode
 
         # Manual: explicit step/zero_grad
-        Y_manual = X @ model_manual.weight.T
-        loss_manual = (Y_manual * Y_manual).mean()
+        Y_manual = model_manual(X)
+        loss_manual = (Y_manual.float() * Y_manual.float()).mean()
         loss_manual.backward()
         opt_manual.step()
         opt_manual.zero_grad()
@@ -934,13 +969,19 @@ def test_gradient_release_matches_manual_step(
         prev_loss_manual = loss_manual.item()
 
         # Check that parameters are close between release and manual
-        torch.testing.assert_close(model_release.weight, model_manual.weight)
+        for p_rel, p_man in zip(model_release.parameters(), model_manual.parameters()):
+            errs = check_tensor_similarity(p_rel, p_man, "grad_release_param", tol=tol)
+            assert not errs, "\n".join(errs)
 
-        # Check that optimizer states are identical
-        for key in opt_config.state_var_names:
-            state_release = opt_release.state[model_release.weight][key].materialize()
-            state_manual = opt_manual.state[model_manual.weight][key].materialize()
-            torch.testing.assert_close(state_release, state_manual)
+        # Check that optimizer states are close
+        for p_rel, p_man in zip(model_release.parameters(), model_manual.parameters()):
+            for key in opt_config.state_var_names:
+                state_release = opt_release.state[p_rel][key].materialize()
+                state_manual = opt_manual.state[p_man][key].materialize()
+                errs = check_tensor_similarity(
+                    state_release, state_manual, f"state_{key}", tol=tol
+                )
+                assert not errs, "\n".join(errs)
 
     handle.remove()
 
@@ -1038,7 +1079,7 @@ def test_fp32_state_dict_roundtrip(opt_config, seed, dtype, master_weight_bits):
         max_abs_diff = (orig - new).abs().max().item()
         max_rel_error = max_abs_diff / (orig.abs().max().item() + 1e-12)
 
-        # Assert thresholds — roundtrip is exact
+        # Assert thresholds - roundtrip is exact
         assert nmse < 1e-9, f"NMSE too high: {nmse:.6f} for {name}"
         assert max_rel_error < 1e-6, (
             f"Max relative error too high: {max_rel_error:.6f} for {name}"
@@ -1322,7 +1363,7 @@ def test_cast_model_fp32_keyword_forward_pass(target_layer, use_pre, input_facto
         if "target" not in name:
             assert p.dtype == torch.bfloat16, f"{name} should be bf16, got {p.dtype}"
 
-    # Forward pass — this is the critical check: fp32 output → bf16 layer
+    # Forward pass - this is the critical check: fp32 output → bf16 layer
     out = model(input_factory())
 
     assert torch.isfinite(out).all(), "output contains NaN or Inf"
@@ -1455,46 +1496,90 @@ def test_sgd_zero_momentum(
 
 
 @pytest.mark.parametrize("seed", SEEDS[:2], ids=seed_id)
+@pytest.mark.parametrize(
+    "dtype,master_weight_bits,quantize",
+    DTYPE_ECC_QUANT_CONFIGS,
+    ids=[dtype_ecc_quant_id(c) for c in DTYPE_ECC_QUANT_CONFIGS],
+)
 def test_multi_param_group(
     opt_config: OptimizerTestConfig,
     seed: int,
+    dtype: torch.dtype,
+    master_weight_bits: int | None,
+    quantize: bool,
 ) -> None:
     """Test optimizer with multiple param groups using different learning rates."""
     device = "cuda"
     D = 32
+    lr1, lr2 = 0.01, 0.001
     torch.manual_seed(seed)
 
-    p1 = torch.randn(D, D, device=device, requires_grad=True)
-    p2 = torch.randn(D, D, device=device, requires_grad=True)
+    # Flash optimizer params
+    p1_flash = torch.randn(D, D, device=device, dtype=dtype, requires_grad=True)
+    p2_flash = torch.randn(D, D, device=device, dtype=dtype, requires_grad=True)
 
-    opt = opt_config.factory(
+    # Reference optimizer params (cloned)
+    p1_ref = p1_flash.detach().clone().float().requires_grad_(True)
+    p2_ref = p2_flash.detach().clone().float().requires_grad_(True)
+
+    opt_flash = opt_config.factory(
         [
-            {"params": [p1], "lr": 0.1},
-            {"params": [p2], "lr": 0.001},
+            {"params": [p1_flash], "lr": lr1},
+            {"params": [p2_flash], "lr": lr2},
         ],
-        quantize=False,
+        quantize=quantize,
+        master_weight_bits=master_weight_bits,
         check_numerics=False,
     )
+    opt_ref = opt_config.reference_factory(
+        [
+            {"params": [p1_ref], "lr": lr1},
+            {"params": [p2_ref], "lr": lr2},
+        ],
+    )
 
-    p1_orig = p1.detach().clone()
-    p2_orig = p2.detach().clone()
+    p1_orig = p1_flash.detach().clone()
+    p2_orig = p2_flash.detach().clone()
 
     for step in range(5):
         torch.manual_seed(seed * 100 + step)
-        p1.grad = torch.randn_like(p1)
-        p2.grad = torch.randn_like(p2)
-        opt.step()
+        g1 = torch.randn(D, D, device=device)
+        g2 = torch.randn(D, D, device=device)
+        p1_flash.grad = g1.clone().to(dtype)
+        p2_flash.grad = g2.clone().to(dtype)
+        p1_ref.grad = g1.clone().float()
+        p2_ref.grad = g2.clone().float()
+        opt_flash.step()
+        opt_ref.step()
 
     # Both params should have changed
-    assert not torch.allclose(p1, p1_orig)
-    assert not torch.allclose(p2, p2_orig)
+    assert not torch.allclose(p1_flash, p1_orig)
+    assert not torch.allclose(p2_flash, p2_orig)
 
     # p1 (higher LR) should change more than p2 (lower LR)
-    delta1 = (p1 - p1_orig).abs().mean().item()
-    delta2 = (p2 - p2_orig).abs().mean().item()
+    delta1 = (p1_flash - p1_orig).abs().mean().item()
+    delta2 = (p2_flash - p2_orig).abs().mean().item()
     assert delta1 > delta2, (
         f"Higher-LR group should change more: delta1={delta1:.6f} <= delta2={delta2:.6f}"
     )
+
+    # Compare flash vs reference for fp32 unquantized only: lower-precision dtypes
+    # and quantization introduce rounding/sign disagreements that compound over steps
+    if dtype == torch.float32 and not quantize:
+        tol = get_tolerances(dtype, quantize)
+        errors = check_tensor_similarity(
+            p1_flash.float(),
+            p1_ref,
+            "p1",
+            tol=tol,
+        )
+        errors += check_tensor_similarity(
+            p2_flash.float(),
+            p2_ref,
+            "p2",
+            tol=tol,
+        )
+        assert not errors, "\n".join(errors)
 
 
 # ============================================================================
@@ -1535,3 +1620,162 @@ def test_fused_unfused_24bit_ecc_match(opt_config: OptimizerTestConfig):
     fp32_u = reconstruct_fp32_param(p_unfused.data, s_unfused["error_bits"])
     sim = cossim(fp32_f.unsqueeze(0).float(), fp32_u.unsqueeze(0).float()).item()
     assert sim > 0.999, f"Fused/unfused cosine similarity too low: {sim}"
+
+
+# ============================================================================
+# Frozen parameter tests
+# ============================================================================
+
+
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=[c.name for c in _OPT_CONFIGS])
+def test_frozen_params_no_state_and_unfreeze(opt_config: OptimizerTestConfig):
+    """Frozen params get no state; unfreezing mid-training allocates state on demand."""
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(42)
+
+    trainable = torch.rand(
+        32, 32, device=device, dtype=torch.float32, requires_grad=True, generator=gen
+    )
+    initially_frozen = torch.rand(
+        32, 32, device=device, dtype=torch.float32, requires_grad=False, generator=gen
+    )
+    initially_frozen_orig = initially_frozen.clone()
+
+    opt = opt_config.factory([trainable, initially_frozen], lr=0.01)
+
+    # Step with frozen param - should not allocate state
+    trainable.grad = torch.rand(
+        trainable.shape, device=device, dtype=trainable.dtype, generator=gen
+    )
+    opt.step()
+    assert trainable in opt.state, "Trainable param should have optimizer state"
+    assert initially_frozen not in opt.state, (
+        "Frozen param should not have optimizer state"
+    )
+
+    # Unfreeze and step - should now allocate state and update
+    initially_frozen.requires_grad = True
+    trainable.grad = torch.rand(
+        trainable.shape, device=device, dtype=trainable.dtype, generator=gen
+    )
+    initially_frozen.grad = torch.rand(
+        initially_frozen.shape,
+        device=device,
+        dtype=initially_frozen.dtype,
+        generator=gen,
+    )
+    opt.step()
+
+    assert initially_frozen in opt.state, (
+        "Unfrozen param should now have optimizer state"
+    )
+    assert not torch.equal(initially_frozen, initially_frozen_orig), (
+        "Unfrozen param should have been updated"
+    )
+
+
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=[c.name for c in _OPT_CONFIGS])
+def test_frozen_params_memory_savings(opt_config: OptimizerTestConfig):
+    """Freezing params should proportionally reduce optimizer state memory."""
+    import gc
+
+    device = "cuda"
+    param_shape = (1024, 1024)  # 4 MB per param in fp32, dwarfs any per-param overhead
+    n_params = 4
+
+    def measure_state_memory(n_frozen: int) -> int:
+        """Return the CUDA memory delta from a single optimizer step.
+
+        All params and grads are allocated *before* the measurement window,
+        so the delta captures only the persistent optimizer state created
+        by ``_ensure_state_initialized`` inside ``step()``.
+        """
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        params: list[torch.Tensor] = []
+        for i in range(n_params):
+            p = torch.randn(*param_shape, device=device)
+            p.requires_grad = i >= n_frozen
+            if p.requires_grad:
+                p.grad = torch.randn(*param_shape, device=device)
+            params.append(p)
+
+        opt = opt_config.factory(params, lr=0.01)
+
+        mem_before = torch.cuda.memory_allocated(device)
+        opt.step()
+        mem_after = torch.cuda.memory_allocated(device)
+
+        del opt, params
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return mem_after - mem_before
+
+    mem_none_frozen = measure_state_memory(n_frozen=0)
+    mem_half_frozen = measure_state_memory(n_frozen=2)
+    mem_all_frozen = measure_state_memory(n_frozen=4)
+
+    # All frozen: step_param() returns early, zero state allocated
+    assert mem_all_frozen == 0, (
+        f"Expected 0 state memory with all frozen, got {mem_all_frozen}"
+    )
+
+    # Half frozen: ~half the state memory
+    assert mem_none_frozen > 0, "Expected non-zero state memory"
+    ratio = mem_half_frozen / mem_none_frozen
+    assert 0.49 < ratio < 0.51, (
+        f"Expected ~50% memory ratio, got {ratio:.4f} "
+        f"(half_frozen={mem_half_frozen}, none_frozen={mem_none_frozen})"
+    )
+
+
+# ============================================================================
+# Non-contiguous tensor test
+# ============================================================================
+
+
+def test_non_contiguous_tensor(opt_config: OptimizerTestConfig) -> None:
+    """Test that fused=True raises on non-contiguous tensors and fused=False handles them."""
+    device = "cuda"
+    D = 32
+    seed = 0
+    torch.manual_seed(seed)
+
+    # Create a contiguous param, then transpose to make non-contiguous
+    p_base = torch.randn(D, D, device=device, dtype=torch.float32)
+    p_nc = p_base.t().requires_grad_(True)
+    assert not p_nc.is_contiguous()
+
+    # fused=True should raise RuntimeError on non-contiguous tensors
+    opt_fused = opt_config.factory(
+        [p_nc], lr=1e-2, quantize=False, fused=True, check_numerics=False
+    )
+    p_nc.grad = torch.randn_like(p_nc)
+    with pytest.raises(RuntimeError):
+        opt_fused.step()
+
+    # fused=False should handle non-contiguous tensors gracefully
+    p_nc2 = p_base.clone().t().requires_grad_(True)
+    assert not p_nc2.is_contiguous()
+
+    opt_unfused = opt_config.factory(
+        [p_nc2], lr=1e-2, quantize=False, fused=False, check_numerics=False
+    )
+
+    torch.manual_seed(42)
+    target = torch.randn(D, D, device=device)
+    initial_loss = ((p_nc2 - target) ** 2).mean().item()
+
+    for step in range(5):
+        loss = ((p_nc2 - target) ** 2).mean()
+        loss.backward()
+        opt_unfused.step()
+        opt_unfused.zero_grad()
+        assert torch.isfinite(p_nc2).all(), f"Non-finite params at step {step}"
+
+    final_loss = ((p_nc2 - target) ** 2).mean().item()
+    assert final_loss < initial_loss, (
+        f"Loss did not decrease: initial={initial_loss:.6f}, final={final_loss:.6f}"
+    )

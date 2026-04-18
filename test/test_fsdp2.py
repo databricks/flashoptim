@@ -314,7 +314,7 @@ def _run_single_fsdp2_config(
         seed=seed,
     )
 
-    # Collect all errors — never raise mid-loop to avoid rank divergence
+    # Collect all errors - never raise mid-loop to avoid rank divergence
     all_errors: list[str] = []
 
     # ===== MODEL CREATION =====
@@ -592,7 +592,7 @@ def _run_fsdp2_accuracy_test(
     opt_config: OptimizerTestConfig = test_config["opt_config"]
 
     for setting in SETTINGS:
-        # Gradient release doesn't support grad accumulation — release hooks fire
+        # Gradient release doesn't support grad accumulation - release hooks fire
         # per-parameter before gradients are synchronized across microbatches.
         if setting.get("grad_release", False) and setting["grad_accum"] > 1:
             continue
@@ -693,6 +693,25 @@ def _run_fsdp2_fp32_state_dict_roundtrip(
     fp32_state_after = opt.get_fp32_model_state_dict(model)
     for name in fp32_state:
         torch.testing.assert_close(fp32_state[name], fp32_state_after[name])
+
+    # Memory leak check: one extra roundtrip must not grow GPU memory
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem_before = torch.cuda.memory_allocated()
+
+    fp32_sd = opt.get_fp32_model_state_dict(model)
+    opt.set_fp32_model_state_dict(model, fp32_sd)
+    del fp32_sd
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem_after = torch.cuda.memory_allocated()
+    assert mem_after <= mem_before + 2**20, (
+        f"[Rank {rank}] Memory leak in fp32 state dict roundtrip: "
+        f"before={mem_before}, after={mem_after}, "
+        f"delta={mem_after - mem_before}"
+    )
 
 
 @pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
@@ -819,6 +838,31 @@ def _run_fsdp2_dcp_state_dict_roundtrip(
     finally:
         reshard_after_comparison(model)
 
+    # Memory leak check: one extra DCP roundtrip must not grow GPU memory
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem_before = torch.cuda.memory_allocated()
+
+    memleak_dir = f"{ckpt_dir}_memleak"
+    saved = get_optimizer_state_dict(model, opt)
+    dcp.save({"optimizer": saved}, checkpoint_id=memleak_dir)
+    dist.barrier()
+    loaded = get_optimizer_state_dict(model, opt)
+    dcp.load({"optimizer": loaded}, checkpoint_id=memleak_dir)
+    set_optimizer_state_dict(model, opt, loaded)
+    del saved, loaded
+    dist.barrier()
+    gc.collect()
+    torch.cuda.empty_cache()
+    mem_after = torch.cuda.memory_allocated()
+    assert mem_after <= mem_before + 2**20, (
+        f"[Rank {rank}] Memory leak in DCP roundtrip: "
+        f"before={mem_before}, after={mem_after}, "
+        f"delta={mem_after - mem_before}"
+    )
+
     del model, opt
     torch.cuda.empty_cache()
     dist.barrier()
@@ -839,6 +883,251 @@ def test_fsdp2_dcp_state_dict_roundtrip(
         _run_fsdp2_dcp_state_dict_roundtrip,
         opt_config,
         compress,
+        master_weight_bits,
+        str(tmp_path / "ckpt"),
+        seed,
+    )
+
+
+# ============================================================================
+# FSDP2 frozen params test
+# ============================================================================
+
+
+def _run_fsdp2_frozen_params(
+    rank: int,
+    world_size: int,
+    opt_config: OptimizerTestConfig,
+    seed: int,
+) -> None:
+    """FSDP2 training with frozen params: frozen params stay unchanged, no state allocated."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    d_in, d_out = 10, 5
+    dtype = torch.bfloat16
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model = _create_simple_model(d_in, d_out).to(device=device, dtype=dtype)
+
+    # Freeze weight matrices, keep biases trainable
+    model[0].weight.requires_grad = False
+    model[2].weight.requires_grad = False
+
+    dist.barrier()
+    fully_shard(model)
+
+    # Capture frozen param values after sharding
+    unshard_for_comparison(model)
+    frozen_params_orig = {
+        name: get_full_tensor(p).clone()
+        for name, p in model.named_parameters()
+        if not p.requires_grad
+    }
+    reshard_after_comparison(model)
+
+    opt = opt_config.factory(
+        model.parameters(),
+        lr=0.01,
+        master_weight_bits=24,
+        check_numerics=False,
+    )
+
+    loss_fn = nn.MSELoss()
+    all_errors: list[str] = []
+
+    g = torch.Generator(device=device).manual_seed(seed + rank)
+    for _step in range(5):
+        x = torch.randn(8, d_in, device=device, dtype=dtype, generator=g)
+        y = torch.randn(8, d_out, device=device, dtype=dtype, generator=g)
+
+        opt.zero_grad(set_to_none=True)
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        opt.step()
+
+    # Verify frozen params unchanged
+    unshard_for_comparison(model)
+    for name, p in model.named_parameters():
+        if name in frozen_params_orig:
+            p_full = get_full_tensor(p)
+            if not torch.equal(p_full, frozen_params_orig[name]):
+                all_errors.append(f"[Rank {rank}] Frozen param {name} was modified")
+    reshard_after_comparison(model)
+
+    # Verify frozen params have no optimizer state
+    for p in model.parameters():
+        if not p.requires_grad and p in opt.state:
+            all_errors.append(f"[Rank {rank}] Frozen param has optimizer state")
+
+    # Verify trainable params have state
+    for p in model.parameters():
+        if p.requires_grad and p not in opt.state:
+            all_errors.append(f"[Rank {rank}] Trainable param missing optimizer state")
+
+    has_errors = torch.tensor([1 if all_errors else 0], device=device)
+    dist.all_reduce(has_errors, op=dist.ReduceOp.MAX)
+
+    if has_errors.item() > 0:
+        if all_errors:
+            raise AssertionError("\n".join(all_errors))
+        else:
+            raise AssertionError(f"[Rank {rank}] Another rank reported errors")
+
+    del model, opt
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=lambda c: c.name)
+def test_fsdp2_frozen_params(
+    opt_config: OptimizerTestConfig, seed: int, fsdp2_runner
+) -> None:
+    """FSDP2 training with frozen params works correctly."""
+    fsdp2_runner(_run_fsdp2_frozen_params, opt_config, seed)
+
+
+# ============================================================================
+# FSDP2 DCP: bit-exact compressed roundtrip + training continuation
+# ============================================================================
+
+_DCP_PRECISION_ECC_CONFIGS = [24, 32]
+
+
+def _run_fsdp2_dcp_training_continuation(
+    rank: int,
+    world_size: int,
+    opt_config: OptimizerTestConfig,
+    master_weight_bits: int,
+    ckpt_dir: str,
+    seed: int,
+) -> None:
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import (
+        get_model_state_dict,
+        get_optimizer_state_dict,
+        set_model_state_dict,
+        set_optimizer_state_dict,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    d_in, d_out = 32, 16
+    dtype = torch.bfloat16
+    lr = 0.001
+    ckpt_step = 3
+    total_steps = 6
+
+    def _make_model_opt():
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        model = _create_simple_model(d_in, d_out).to(device=device, dtype=dtype)
+        dist.barrier()
+        fully_shard(model)
+        opt = opt_config.factory(
+            model.parameters(),
+            lr=lr,
+            compress_state_dict=True,
+            master_weight_bits=master_weight_bits,
+        )
+        return model, opt
+
+    def _train(model, opt, g, steps):
+        loss_fn = nn.MSELoss()
+        for _ in range(steps):
+            x = torch.randn(8, d_in, device=device, dtype=dtype, generator=g)
+            y = torch.randn(8, d_out, device=device, dtype=dtype, generator=g)
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+
+    # --- Continuous baseline: train all steps ---
+    model_base, opt_base = _make_model_opt()
+    g_base = torch.Generator(device=device).manual_seed(seed + rank)
+    _train(model_base, opt_base, g_base, total_steps)
+
+    # --- Checkpoint + resume ---
+    model_a, opt_a = _make_model_opt()
+    g_a = torch.Generator(device=device).manual_seed(seed + rank)
+    _train(model_a, opt_a, g_a, ckpt_step)
+
+    # Save model + optimizer via DCP
+    saved_osd = get_optimizer_state_dict(model_a, opt_a)
+    saved_msd = get_model_state_dict(model_a)
+    dcp.save({"model": saved_msd, "optimizer": saved_osd}, checkpoint_id=ckpt_dir)
+    dist.barrier()
+
+    # Load into fresh model+opt via DCP
+    model_b, opt_b = _make_model_opt()
+    loaded_msd = get_model_state_dict(model_b)
+    loaded_osd = get_optimizer_state_dict(model_b, opt_b)
+    dcp.load({"model": loaded_msd, "optimizer": loaded_osd}, checkpoint_id=ckpt_dir)
+    set_model_state_dict(model_b, loaded_msd)
+    set_optimizer_state_dict(model_b, opt_b, loaded_osd)
+
+    # Verify optimizer state survived roundtrip bit-exactly
+    for p_a, p_b in zip(model_a.parameters(), model_b.parameters()):
+        if p_a not in opt_a.state:
+            continue
+        for key in opt_config.state_var_names:
+            orig = opt_a.state[p_a][key]
+            loaded = opt_b.state[p_b][key]
+            assert torch.equal(orig.quantized, loaded.quantized), (
+                f"[Rank {rank}] {key} quantized not bit-identical after DCP roundtrip"
+            )
+            assert torch.equal(orig.scales, loaded.scales), (
+                f"[Rank {rank}] {key} scales not bit-identical after DCP roundtrip"
+            )
+        if "error_bits" in opt_a.state[p_a]:
+            assert torch.equal(
+                opt_a.state[p_a]["error_bits"].view(dtype=torch.int8),
+                opt_b.state[p_b]["error_bits"].view(dtype=torch.int8),
+            ), f"[Rank {rank}] error_bits not bit-identical after DCP roundtrip"
+
+    # Continue training after load
+    _train(model_b, opt_b, g_a, total_steps - ckpt_step)
+
+    # Compare resumed params to continuous baseline
+    unshard_for_comparison(model_base)
+    unshard_for_comparison(model_b)
+    try:
+        for (name, p_base), p_resumed in zip(
+            model_base.named_parameters(), model_b.parameters()
+        ):
+            p_base_full = get_full_tensor(p_base)
+            p_resumed_full = get_full_tensor(p_resumed)
+            assert torch.equal(p_base_full, p_resumed_full), (
+                f"[Rank {rank}] Parameter '{name}' diverged after "
+                f"DCP checkpoint + resume"
+            )
+    finally:
+        reshard_after_comparison(model_base)
+        reshard_after_comparison(model_b)
+
+    del model_base, opt_base, model_a, opt_a, model_b, opt_b
+    torch.cuda.empty_cache()
+    dist.barrier()
+
+
+@pytest.mark.parametrize("seed", [0], ids=lambda s: f"seed{s}")
+@pytest.mark.parametrize(
+    "master_weight_bits", _DCP_PRECISION_ECC_CONFIGS, ids=lambda b: f"ecc{b}b"
+)
+@pytest.mark.parametrize("opt_config", _OPT_CONFIGS, ids=lambda c: c.name)
+def test_fsdp2_dcp_training_continuation(
+    opt_config: OptimizerTestConfig,
+    master_weight_bits: int,
+    seed: int,
+    fsdp2_runner,
+    tmp_path,
+) -> None:
+    fsdp2_runner(
+        _run_fsdp2_dcp_training_continuation,
+        opt_config,
         master_weight_bits,
         str(tmp_path / "ckpt"),
         seed,
