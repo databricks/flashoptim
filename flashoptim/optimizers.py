@@ -629,6 +629,13 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         DCP requires optimizer state tensors to carry the same DTensor metadata
         (mesh, placements) as their corresponding parameters. Without this,
         DCP treats local shards as replicated data and scrambles them on load.
+
+        For state tensors whose local shape matches the param's local shape,
+        we pass ``shape`` and ``stride`` explicitly so wrapping is correct for
+        both even and uneven shards — ``DTensor.from_local``'s default global
+        shape inference (``local_size * world_size``) is only right for even
+        splits. For tensors with a different layout (e.g. quantized state,
+        which has its own packed shape), we fall back to default inference.
         """
         if not hasattr(param, "device_mesh"):
             return
@@ -636,20 +643,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
 
         mesh = param.device_mesh
         placements = param.placements
-
-        # Reject uneven shards - DTensor.from_local infers global shape as
-        # local_size * world_size, which is only correct for even splits.
-        #
-        # In full-state-dict export paths, leaving tensors unwrapped is still
-        # preferable to raising here, since the caller may only need a regular
-        # gathered state dict. We therefore bail out silently for uneven shards
-        # instead of failing checkpoint saving entirely.
-        for mesh_dim, placement in enumerate(placements):
-            if hasattr(placement, "dim"):
-                shard_dim = placement.dim
-                mesh_size = mesh.size(mesh_dim)
-                if param.shape[shard_dim] % mesh_size != 0:
-                    return
+        param_local_shape = param.to_local().shape
 
         for key, val in state.items():
             if (
@@ -657,7 +651,17 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
                 and not isinstance(val, DTensor)
                 and val.dim() > 0
             ):
-                state[key] = DTensor.from_local(val, mesh, placements)
+                if val.shape == param_local_shape:
+                    state[key] = DTensor.from_local(
+                        val,
+                        mesh,
+                        placements,
+                        shape=param.shape,
+                        stride=param.stride(),
+                        run_check=False,
+                    )
+                else:
+                    state[key] = DTensor.from_local(val, mesh, placements)
 
     def _recompute_stats_for_param(self, p: torch.Tensor) -> None:
         p_for_stats = self._get_tensor_for_stats(p)
