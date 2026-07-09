@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/databricks/flashoptim/refs/heads/assets/imgs/flashoptim_ithaca_italic.png" alt="FlashOptim" width="650">
 
-This is the official implementation of [FlashOptim: Optimizers for Memory-Efficient Training](https://arxiv.org/abs/2602.23349)
+This is the official implementation of [FlashOptim: Optimizers for Memory-Efficient Training](https://openreview.net/forum?id=Wfe1iJocjF), accepted as a Spotlight paper at ICML 2026.
 
 By [Jose Javier Gonzalez Ortiz](https://x.com/jjgort), [Abhay Gupta](https://x.com/gupta__abhay), [Christopher Rinard](https://x.com/ChrisRinard), and [Davis Blalock](https://x.com/davisblalock).
 
@@ -9,7 +9,8 @@ By [Jose Javier Gonzalez Ortiz](https://x.com/jjgort), [Abhay Gupta](https://x.c
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.9-blue)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/pytorch-%3E%3D2.6-ee4c2c)](https://pytorch.org/)
-[![arXiv](https://img.shields.io/badge/arXiv-2602.23349-b31b1b.svg)](https://arxiv.org/abs/2602.23349)
+[![Paper](https://img.shields.io/badge/Paper-OpenReview-blue)](https://openreview.net/forum?id=Wfe1iJocjF)
+[![ICML 2026](https://img.shields.io/badge/ICML_2026-Spotlight-purple)](https://openreview.net/forum?id=Wfe1iJocjF)
 
 ## TL;DR
 
@@ -310,13 +311,15 @@ For contributing to FlashOptim, please see our [contributing guidelines](CONTRIB
 
 ## 7. Citation
 
-If you use FlashOptim in your research, please cite our paper:
+If you use FlashOptim in your research, please cite our ICML 2026 Spotlight paper:
 
 ```bibtex
-@article{gonzalezblalock2026flashoptim,
+@inproceedings{gonzalezblalock2026flashoptim,
   title={FlashOptim: Optimizers for Memory-Efficient Training},
   author={Gonzalez Ortiz, Jose Javier and Gupta, Abhay and Rinard, Christopher and Blalock, Davis},
-  journal={arXiv preprint arXiv:2602.23349},
-  year={2026}
+  booktitle={International Conference on Machine Learning (ICML)},
+  note={Spotlight},
+  year={2026},
+  url={https://openreview.net/forum?id=Wfe1iJocjF}
 }
 ```
