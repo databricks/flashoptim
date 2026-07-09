@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/databricks/flashoptim/refs/heads/assets/imgs/flashoptim_ithaca_italic.png" alt="FlashOptim" width="650">
 
-This is the official implementation of [FlashOptim: Optimizers for Memory-Efficient Training](https://openreview.net/forum?id=Wfe1iJocjF), accepted as a Spotlight paper at ICML 2026.
+This is the official implementation of [FlashOptim: Optimizers for Memory-Efficient Training](https://openreview.net/forum?id=Wfe1iJocjF), accepted as a **Spotlight paper at ICML 2026**.
 
 By [Jose Javier Gonzalez Ortiz](https://x.com/jjgort), [Abhay Gupta](https://x.com/gupta__abhay), [Christopher Rinard](https://x.com/ChrisRinard), and [Davis Blalock](https://x.com/davisblalock).
 
