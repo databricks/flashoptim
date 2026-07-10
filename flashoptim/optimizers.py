@@ -636,28 +636,42 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
 
         mesh = param.device_mesh
         placements = param.placements
+        param_local_shape = param.to_local().shape
 
-        # Reject uneven shards - DTensor.from_local infers global shape as
-        # local_size * world_size, which is only correct for even splits.
-        for mesh_dim, placement in enumerate(placements):
-            if hasattr(placement, "dim"):
-                shard_dim = placement.dim
-                mesh_size = mesh.size(mesh_dim)
-                if param.shape[shard_dim] % mesh_size != 0:
-                    raise ValueError(
-                        f"DCP checkpointing requires evenly-sharded parameters, "
-                        f"but parameter with shape {param.shape} is unevenly "
-                        f"sharded on dim {shard_dim} across {mesh_size} ranks. "
-                        f"Pad or reshape the parameter so that shape[{shard_dim}] "
-                        f"is divisible by {mesh_size}."
-                    )
+        uneven = any(
+            param.shape[p.dim] % mesh.size(i) != 0
+            for i, p in enumerate(placements)
+            if hasattr(p, "dim")
+        )
 
         for key, val in state.items():
-            if (
+            if not (
                 isinstance(val, torch.Tensor)
                 and not isinstance(val, DTensor)
                 and val.dim() > 0
             ):
+                continue
+            if val.shape == param_local_shape:
+                # Pass explicit shape/stride so wrapping is correct on uneven shards.
+                state[key] = DTensor.from_local(
+                    val,
+                    mesh,
+                    placements,
+                    shape=param.shape,
+                    stride=param.stride(),
+                    run_check=False,
+                )
+            elif uneven:
+                # e.g. quantized state with a packed shape: default inference
+                # would scramble DCP on uneven shards, and we have no global
+                # shape for this layout. Fail loudly rather than silently.
+                raise ValueError(
+                    f"Cannot safely wrap state tensor {key!r} of shape "
+                    f"{tuple(val.shape)} as a DTensor for unevenly-sharded "
+                    f"param of shape {tuple(param.shape)}: its layout does "
+                    f"not match the param, so the global shape is unknown."
+                )
+            else:
                 state[key] = DTensor.from_local(val, mesh, placements)
 
     def _recompute_stats_for_param(self, p: torch.Tensor) -> None:
@@ -988,7 +1002,7 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
             for param_number in group["params"]:
                 assert isinstance(param_number, int)
                 if param_number not in opt_state:
-                    continue  # frozen param, no optimizer state
+                    continue  # frozen or pre-first-step param, no optimizer state
                 opt_state[param_number] = self._state_dict_for_param(
                     param_number,
                     opt_state=opt_state,
@@ -1083,6 +1097,14 @@ class FlashOptimizer(torch.optim.Optimizer, abc.ABC):
         # FSDP2 support: state tensors must be created from local tensors, not DTensors.
         # This ensures each rank has state for its local parameter shard.
         p_local = self._get_local_tensor(p)
+        if not p_local.is_cuda:
+            raise ValueError(
+                "FlashOptim requires parameter shards to be on CUDA at optimizer "
+                "step time. Detected a CPU shard while initializing optimizer "
+                "state, which usually means FSDP2 or ZeRO CPU offload is enabled. "
+                "Disable CPU parameter offload to use FlashOptim, for example "
+                "set fsdp_offload_params: false."
+            )
 
         quantize = hparams.get("quantize", self._quantize)
         for key_quant, spec in self.quantized_state_spec.items():
